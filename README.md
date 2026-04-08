@@ -1,4 +1,4 @@
-# media_archiver
+# media-archiver
 
 A collection of Python scripts for organizing, compressing, and deduplicating media archives.
 
