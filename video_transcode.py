@@ -5,12 +5,17 @@ video_transcode.py -- Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC)
 Encodes only files whose bitrate exceeds max_bitrate. Files at or below the
 threshold are skipped. Audio tracks are copied without re-encoding.
 
+Without --output-dir, originals are replaced in place: each file is encoded to
+a temporary file alongside it, verified (exit code, non-empty output, and
+duration matching the source), and only then does the original get deleted.
+If the result is not smaller than the original, the original is kept.
+
 Usage:
     python video_transcode.py <folder> --max-bitrate <kbps> [options]
 
 Options:
     --max-bitrate <kbps>    Target maximum bitrate in kbps (required)
-    --output-dir <path>     Output directory (default: <folder>/converted)
+    --output-dir <path>     Output directory (default: replace originals in place)
     --recursive             Process subdirectories recursively
     --execute               Apply transcoding (default: preview only)
     --dry-run               Print the exact HandBrakeCLI commands without running them
@@ -37,7 +42,12 @@ SUPPORTED_EXTENSIONS = {
     ".flv", ".mts", ".m2ts", ".3gp", ".webm",
 }
 
-OUTPUT_SUBDIR = "converted"
+# Suffix used for the in-progress file written next to (or in place of) the output.
+TEMP_SUFFIX = ".transcoding.tmp.mp4"
+
+# Output duration may differ slightly from the source; anything beyond this is
+# treated as a failed transcode and the original is never deleted.
+DURATION_TOLERANCE_SEC = 1.0
 
 # -- Tool detection -----------------------------------------------------------
 
@@ -64,27 +74,29 @@ def find_ffprobe() -> str:
 
 # -- Bitrate probing ----------------------------------------------------------
 
-def get_bitrate_kbps(ffprobe: str, filepath: Path) -> float | None:
-    """Return overall bitrate in kbps using ffprobe, or None on failure."""
+def probe_format(ffprobe: str, filepath: Path) -> tuple[float | None, float | None]:
+    """Return (bitrate in kbps, duration in seconds) via ffprobe; None for either on failure."""
     cmd = [
         ffprobe, "-v", "quiet",
         "-print_format", "json",
         "-show_format",
         str(filepath),
     ]
+    bitrate, duration = None, None
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        data = json.loads(result.stdout)
-        bit_rate = data.get("format", {}).get("bit_rate")
-        if bit_rate:
-            return float(bit_rate) / 1000  # bps -> kbps
+        fmt = json.loads(result.stdout).get("format", {})
+        if fmt.get("bit_rate"):
+            bitrate = float(fmt["bit_rate"]) / 1000  # bps -> kbps
+        if fmt.get("duration"):
+            duration = float(fmt["duration"])
     except Exception:
         pass
-    return None
+    return bitrate, duration
 
 # -- File collection ----------------------------------------------------------
 
-def collect_files(folder: Path, recursive: bool, output_dir: Path) -> list[Path]:
+def collect_files(folder: Path, recursive: bool, output_dir: Path | None) -> list[Path]:
     pattern = "**/*" if recursive else "*"
     files = []
     for p in folder.glob(pattern):
@@ -92,12 +104,16 @@ def collect_files(folder: Path, recursive: bool, output_dir: Path) -> list[Path]
             continue
         if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
-        # Skip files that are already inside the output directory
-        try:
-            p.relative_to(output_dir)
+        # Skip leftovers from an interrupted run
+        if p.name.endswith(TEMP_SUFFIX):
             continue
-        except ValueError:
-            pass
+        # Skip files that are already inside the output directory
+        if output_dir is not None:
+            try:
+                p.relative_to(output_dir)
+                continue
+            except ValueError:
+                pass
         files.append(p)
     return sorted(files)
 
@@ -107,7 +123,7 @@ def build_plan(
     files: list[Path],
     ffprobe: str,
     max_bitrate: float,
-    output_dir: Path,
+    output_dir: Path | None,
     folder: Path,
     recursive: bool,
     postfix: str = "",
@@ -117,20 +133,28 @@ def build_plan(
       {
         "path":      Path,
         "bitrate":   float | None,   # kbps
+        "duration":  float | None,   # seconds
         "action":    "transcode" | "skip" | "probe_failed",
         "output":    Path | None,
       }
+
+    With output_dir None, each file is replaced in place: the output lands next
+    to the source as .mp4 (the container HandBrake writes), so a non-mp4 source
+    such as foo.mkv becomes foo.mp4 and the original is removed afterwards.
     """
+    in_place = output_dir is None
     plan = []
+    claimed: set[Path] = set()   # output paths already handed out by this plan
     total = len(files)
     for i, filepath in enumerate(files, 1):
         print(f"  Probing {i}/{total}: {filepath.name} ...", end="\r", flush=True)
-        bitrate = get_bitrate_kbps(ffprobe, filepath)
+        bitrate, duration = probe_format(ffprobe, filepath)
 
         if bitrate is None:
             plan.append({
                 "path": filepath,
                 "bitrate": None,
+                "duration": duration,
                 "action": "probe_failed",
                 "output": None,
             })
@@ -140,6 +164,7 @@ def build_plan(
             plan.append({
                 "path": filepath,
                 "bitrate": bitrate,
+                "duration": duration,
                 "action": "skip",
                 "output": None,
             })
@@ -147,18 +172,23 @@ def build_plan(
 
         # Determine output path, mirroring subfolder structure if recursive
         stem = filepath.stem + postfix
-        if recursive:
+        if in_place:
+            out_path = filepath.parent / (stem + ".mp4")
+            # The source is only a "conflict" with itself when it is already .mp4
+            # and no postfix was given -- that is exactly the overwrite we want.
+            if out_path != filepath:
+                out_path = resolve_conflict(out_path, claimed)
+        elif recursive:
             rel = filepath.relative_to(folder)
-            out_path = output_dir / rel.parent / (stem + ".mp4")
+            out_path = resolve_conflict(output_dir / rel.parent / (stem + ".mp4"), claimed)
         else:
-            out_path = output_dir / (stem + ".mp4")
-
-        # Resolve name conflicts
-        out_path = resolve_conflict(out_path)
+            out_path = resolve_conflict(output_dir / (stem + ".mp4"), claimed)
+        claimed.add(out_path)
 
         plan.append({
             "path": filepath,
             "bitrate": bitrate,
+            "duration": duration,
             "action": "transcode",
             "output": out_path,
         })
@@ -166,35 +196,48 @@ def build_plan(
     print(" " * 60, end="\r")  # clear progress line
     return plan
 
-def resolve_conflict(target: Path) -> Path:
-    if not target.exists():
+def resolve_conflict(target: Path, claimed: set[Path]) -> Path:
+    """Return target, or the first _2/_3/... variant that neither exists nor is claimed."""
+    if not target.exists() and target not in claimed:
         return target
     counter = 2
     while True:
         candidate = target.parent / f"{target.stem}_{counter}{target.suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and candidate not in claimed:
             return candidate
         counter += 1
 
+def temp_path_for(dst: Path) -> Path:
+    """In-progress path written by HandBrake, promoted to dst only after verification."""
+    return dst.parent / (dst.stem + TEMP_SUFFIX)
+
 # -- Preview ------------------------------------------------------------------
 
-def print_preview(plan: list[dict], max_bitrate: float, output_dir: Path):
+def print_preview(plan: list[dict], max_bitrate: float, output_dir: Path | None):
     transcode = [e for e in plan if e["action"] == "transcode"]
     skip      = [e for e in plan if e["action"] == "skip"]
     failed    = [e for e in plan if e["action"] == "probe_failed"]
 
     print(f"\n{'─'*72}")
     print(f"  max-bitrate : {max_bitrate:.0f} kbps")
-    print(f"  output-dir  : {output_dir}")
+    if output_dir is None:
+        print("  output-dir  : (none -- originals are replaced in place)")
+    else:
+        print(f"  output-dir  : {output_dir}")
     print(f"  Total files : {len(plan)}")
     print(f"{'─'*72}")
 
     if transcode:
         print(f"\n  To be transcoded ({len(transcode)}):\n")
+        if output_dir is None:
+            print("    [WARN] Originals are deleted once the new file is verified.\n")
         for e in transcode:
             br = f"{e['bitrate']:.0f} kbps"
             print(f"    {e['path'].name}  [{br}]")
-            print(f"      -> {e['output'].name}")
+            if e["output"] == e["path"]:
+                print(f"      -> {e['output'].name}  (replaced in place)")
+            else:
+                print(f"      -> {e['output'].name}")
 
     if skip:
         print(f"\n  Below threshold, skipped ({len(skip)}):\n")
@@ -230,10 +273,12 @@ def print_dry_run(plan: list[dict], handbrake: str, max_bitrate: float):
 
     print(f"\n{'─'*72}")
     print(f"  Dry run -- {len(to_transcode)} command(s) that would be executed ({shell_label}):")
+    print(f"  Each writes to a {TEMP_SUFFIX} file, which is verified and then renamed.")
     print(f"{'─'*72}\n")
 
     for i, entry in enumerate(to_transcode, 1):
-        cmd    = build_handbrake_cmd(handbrake, entry["path"], entry["output"], max_bitrate)
+        tmp    = temp_path_for(entry["output"])
+        cmd    = build_handbrake_cmd(handbrake, entry["path"], tmp, max_bitrate)
         quoted = [_quote(arg) for arg in cmd]
         print(f"# [{i}/{len(to_transcode)}] {entry['path'].name}  ({entry['bitrate']:.0f} kbps)")
         if is_windows:
@@ -278,13 +323,46 @@ def build_handbrake_cmd(
         "--optimize",                                # fast-start for streaming
     ]
 
+# -- Verification -------------------------------------------------------------
+
+def verify_output(ffprobe: str, produced: Path, src_duration: float | None) -> str | None:
+    """
+    Check that `produced` is a usable video. Return None if it passes, or a
+    human-readable reason describing why it must not replace the source.
+    """
+    if not produced.exists():
+        return "output file was not created"
+    if produced.stat().st_size == 0:
+        return "output file is empty"
+
+    _, duration = probe_format(ffprobe, produced)
+    if duration is None:
+        return "output file has no readable duration (probe failed)"
+    if src_duration is None:
+        return "source duration is unknown, cannot verify output"
+    delta = abs(duration - src_duration)
+    if delta > DURATION_TOLERANCE_SEC:
+        return (f"duration mismatch: source {src_duration:.1f}s vs "
+                f"output {duration:.1f}s (off by {delta:.1f}s)")
+    return None
+
+def copy_timestamps(src: Path, dst: Path):
+    """Carry the source's access/modification times over so archival dates survive."""
+    try:
+        st = src.stat()
+        os.utime(dst, (st.st_atime, st.st_mtime))
+    except OSError as e:
+        print(f"  [WARN] Could not copy timestamps: {e}")
+
 # -- Execution ----------------------------------------------------------------
 
 def execute_plan(
     plan: list[dict],
     handbrake: str,
+    ffprobe: str,
     max_bitrate: float,
     skip_errors: bool,
+    in_place: bool,
     show_log: bool = False,
 ):
     to_transcode = [e for e in plan if e["action"] == "transcode"]
@@ -294,7 +372,18 @@ def execute_plan(
         return
 
     print(f"\nTranscoding {len(to_transcode)} file(s)...\n")
-    success, skipped = 0, 0
+    success, skipped, kept = 0, 0, 0
+
+    def fail(message: str, tmp: Path) -> int:
+        """Report a failure, discard the partial output, and honour --skip-errors."""
+        print(f"  [ERROR] {message}")
+        if tmp.exists():
+            tmp.unlink()
+        if not skip_errors:
+            print("\nAborted. Use --skip-errors to continue past failures.")
+            print("The original file was left untouched.")
+            sys.exit(1)
+        return 1
 
     for i, entry in enumerate(to_transcode, 1):
         src = entry["path"]
@@ -302,41 +391,69 @@ def execute_plan(
         br  = f"{entry['bitrate']:.0f}"
 
         print(f"  [{i}/{len(to_transcode)}] {src.name}  ({br} kbps -> {int(max_bitrate)} kbps)")
-        print(f"         -> {dst}")
+        print(f"         -> {dst}" + ("  (in place)" if in_place else ""))
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        cmd = build_handbrake_cmd(handbrake, src, dst, max_bitrate)
+        tmp = temp_path_for(dst)
+        cmd = build_handbrake_cmd(handbrake, src, tmp, max_bitrate)
 
         try:
+            if tmp.exists():
+                tmp.unlink()  # leftover from an interrupted run
+
             result = subprocess.run(cmd, text=True, capture_output=not show_log)
-            if result.returncode == 0:
-                print(f"  [OK]")
-                success += 1
-            else:
-                print(f"  [ERROR] HandBrakeCLI exited with code {result.returncode}")
+            if result.returncode != 0:
+                message = f"HandBrakeCLI exited with code {result.returncode}"
                 if not show_log and result.stderr:
-                    for line in result.stderr.strip().splitlines()[-5:]:
-                        print(f"           {line}")
-                if dst.exists():
-                    dst.unlink()  # remove incomplete output
-                if not skip_errors:
-                    print("\nAborted. Use --skip-errors to continue past failures.")
-                    sys.exit(1)
-                skipped += 1
+                    message += "\n" + "\n".join(
+                        f"           {line}" for line in result.stderr.strip().splitlines()[-5:]
+                    )
+                skipped += fail(message, tmp)
+                print()
+                continue
+
+            reason = verify_output(ffprobe, tmp, entry["duration"])
+            if reason:
+                skipped += fail(f"Verification failed -- {reason}", tmp)
+                print()
+                continue
+
+            # Transcoding a file that is already efficiently encoded can inflate
+            # it; replacing the original in that case would make the archive worse.
+            if in_place and tmp.stat().st_size >= src.stat().st_size:
+                old_mb = src.stat().st_size / 1024 / 1024
+                new_mb = tmp.stat().st_size / 1024 / 1024
+                print(f"  [KEPT] Output is not smaller "
+                      f"({old_mb:.1f} MB -> {new_mb:.1f} MB); original kept.")
+                tmp.unlink()
+                kept += 1
+                print()
+                continue
+
+            copy_timestamps(src, tmp)
+
+            # Only now is the original expendable: the replacement is verified on disk.
+            if in_place:
+                src.unlink()
+            tmp.replace(dst)
+
+            print("  [OK]")
+            success += 1
+
         except KeyboardInterrupt:
             print("\n[INTERRUPTED] Cleaning up partial output...")
-            if dst.exists():
-                dst.unlink()
+            if tmp.exists():
+                tmp.unlink()
             sys.exit(130)
         except Exception as e:
-            print(f"  [ERROR] {e}")
-            if not skip_errors:
-                sys.exit(1)
-            skipped += 1
+            skipped += fail(str(e), tmp)
 
         print()
 
-    print(f"Done. Transcoded: {success}, skipped/failed: {skipped}\n")
+    summary = f"Done. Transcoded: {success}, skipped/failed: {skipped}"
+    if in_place:
+        summary += f", kept (not smaller): {kept}"
+    print(summary + "\n")
 
 # -- Entry point --------------------------------------------------------------
 
@@ -350,7 +467,7 @@ def main():
     parser.add_argument("--max-bitrate",   type=float, required=True, metavar="KBPS",
                         help="Maximum bitrate in kbps; files above this are transcoded")
     parser.add_argument("--output-dir",    metavar="PATH",
-                        help=f"Output directory (default: <folder>/{OUTPUT_SUBDIR})")
+                        help="Output directory (default: replace the original files in place)")
     parser.add_argument("--recursive",     action="store_true",
                         help="Process subdirectories recursively")
     parser.add_argument("--execute",       action="store_true",
@@ -377,8 +494,9 @@ def main():
         print(f"[ERROR] Folder not found: {folder}")
         sys.exit(1)
 
-    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir \
-                 else folder / OUTPUT_SUBDIR
+    # No --output-dir means in-place replacement of the originals.
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+    in_place   = output_dir is None
 
     # Collect files
     print("Scanning files...")
@@ -409,9 +527,15 @@ def main():
         if to_do == 0:
             print("No files exceed the bitrate threshold. Nothing to do.\n")
             return
-        confirm = input(f"Transcode {to_do} file(s)? [y/N] ").strip().lower()
+        if in_place:
+            prompt = (f"Transcode {to_do} file(s) IN PLACE? "
+                      f"Each original is deleted once its replacement is verified. [y/N] ")
+        else:
+            prompt = f"Transcode {to_do} file(s)? [y/N] "
+        confirm = input(prompt).strip().lower()
         if confirm == "y":
-            execute_plan(plan, handbrake, args.max_bitrate, args.skip_errors, args.show_log)
+            execute_plan(plan, handbrake, ffprobe, args.max_bitrate,
+                         args.skip_errors, in_place, args.show_log)
         else:
             print("Cancelled.\n")
 

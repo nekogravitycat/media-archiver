@@ -62,6 +62,8 @@ python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --exe
 
 Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds `--max-bitrate` are transcoded; others are skipped. Audio tracks are copied without re-encoding.
 
+By default the originals are **replaced in place**, and each one is deleted only after its replacement has been verified — see [In-place replacement](#in-place-replacement-no---output-dir). Pass `--output-dir` to write elsewhere and leave the originals untouched.
+
 ### Requirements
 
 - [HandBrake](https://handbrake.fr/) (provides `HandBrakeCLI`)
@@ -83,7 +85,7 @@ python video_transcode.py <folder> --max-bitrate <kbps> [options]
 | Option                 | Description                                                |
 | ---------------------- | ---------------------------------------------------------- |
 | `--max-bitrate <kbps>` | Files above this bitrate are transcoded **(required)**     |
-| `--output-dir <path>`  | Output directory (default: `<folder>/converted`)           |
+| `--output-dir <path>`  | Output directory (default: replace the originals in place) |
 | `--recursive`          | Process subdirectories recursively                         |
 | `--execute`            | Apply transcoding (default: preview only)                  |
 | `--dry-run`            | Print the exact HandBrakeCLI commands without running them |
@@ -98,10 +100,10 @@ python video_transcode.py <folder> --max-bitrate <kbps> [options]
 # Preview which files exceed 8000 kbps
 python video_transcode.py ~/Videos --max-bitrate 8000
 
-# Transcode files above 8000 kbps into ~/Videos/converted/
+# Replace the originals in place
 python video_transcode.py ~/Videos --max-bitrate 8000 --execute
 
-# Use a custom output directory
+# Write to a separate output directory instead, leaving the originals alone
 python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --execute
 
 # Print the exact HandBrakeCLI commands that would run (no transcoding)
@@ -109,6 +111,19 @@ python video_transcode.py ~/Videos --max-bitrate 8000 --dry-run
 ```
 
 Output files mirror the source folder structure when `--recursive` is used. Naming conflicts are resolved automatically by appending `_2`, `_3`, etc.
+
+### In-place replacement (no `--output-dir`)
+
+Without `--output-dir`, each original is replaced by its transcoded version. The original is never deleted before its replacement exists and has been checked:
+
+1. HandBrake encodes to a temporary `*.transcoding.tmp.mp4` file next to the destination.
+2. The result is verified — HandBrakeCLI exited `0`, the file exists and is non-empty, and its duration is within 1 second of the source.
+3. If the result is **not smaller** than the original, it is discarded and the original kept (reported as `kept (not smaller)`).
+4. Only then is the original deleted and the temporary file renamed into place.
+
+Any failure at steps 1–2 discards the temporary file and leaves the original untouched; interrupting with `Ctrl-C` does the same. The new file inherits the original's modification and access times, so date-based tooling such as `media_date_rename.py` keeps working.
+
+Because HandBrake writes an MP4 container, a non-MP4 source changes extension: `foo.mkv` becomes `foo.mp4` and `foo.mkv` is removed. If `foo.mp4` already exists, the output becomes `foo_2.mp4`.
 
 ---
 
