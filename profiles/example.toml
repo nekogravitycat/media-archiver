@@ -1,0 +1,52 @@
+# Example profile for video_transcode.py
+#
+# Copy this file to profiles/<name>.toml (or ~/.config/media-archiver/profiles/)
+# and use it with:   python video_transcode.py <folder> -p <name>
+#
+# Only profiles/example.toml is tracked by git; your own profiles are ignored.
+# Every key is optional. CLI flags override the values here. Unknown keys are
+# rejected, so a typo fails loudly instead of being ignored.
+#
+# Per-run choices (--execute, --output-dir, --recursive, --postfix, ...) are
+# deliberately not settable here.
+
+# Scale anything larger down to fit this box (orientation follows the video).
+# Accepts 1080p, 1440p, 4k, 8k, or WxH.          CLI: --max-resolution
+max_resolution = "1440p"
+
+# Skip files whose estimated saving is below this percentage.   CLI: --min-saving
+min_saving = 15
+
+[bitrate]
+# Absolute ceiling in kbps, at every resolution.  CLI: --max-bitrate
+max = 20000
+
+# --- Option A: one reference point, scaled by pixel count ------------------
+# limit = 6000 * (output pixels / 1920x1080 pixels) ^ exponent
+#   -> 720p ~3300, 1080p 6000, 1440p ~9200, 4k ~17000 kbps (before the cap)
+# CLI: --ref-bitrate 6000@1080p
+reference = "6000@1080p"
+
+# 1.0 = linear in pixels. Equal quality needs less than that at higher
+# resolutions; 0.7-0.8 is typical for HEVC. Default: 0.75.
+# Also used to scale the source bitrate down when a file is downscaled.
+exponent = 0.75
+
+# --- Option B: explicit table (use instead of `reference`, not both) -------
+# Resolutions in between are interpolated on a log-log curve; beyond either
+# end the nearest segment's slope is extended. Bitrates must not decrease
+# as resolution increases.
+#
+# [bitrate.table]
+# "720p"  = 3500
+# "1080p" = 6000
+# "1440p" = 10000
+# "4k"    = 18000
+
+# --- Optional frame-rate adjustment -----------------------------------------
+# limit *= (fps / reference) ^ exponent; with these values a 60 fps file gets
+# ~1.41x the budget of a 30 fps one. Requires option A or B. Default exponent: 0.5.
+#
+# [bitrate.fps]
+# reference = 30
+# exponent  = 0.5

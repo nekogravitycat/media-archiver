@@ -2,9 +2,14 @@
 """
 video_transcode.py -- Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC).
 
-Encodes files whose bitrate exceeds --max-bitrate and/or whose resolution
+Encodes files whose bitrate exceeds their bitrate limit and/or whose resolution
 exceeds --max-resolution. Other files are skipped. Audio tracks are copied
 without re-encoding.
+
+The bitrate limit is either fixed (--max-bitrate) or scaled to each file's
+output resolution (--ref-bitrate, or a [bitrate.table] in a profile), so a
+1080p file gets a smaller budget than a 1440p one at the same quality level.
+--max-bitrate always acts as an absolute ceiling.
 
 Without --output-dir, originals are replaced in place: each file is encoded to
 a temporary file alongside it, verified (exit code, non-empty output, and
@@ -15,12 +20,19 @@ Usage:
     python video_transcode.py <folder> [--max-bitrate <kbps>] [--max-resolution <res>] [options]
 
 Options:
-    --max-bitrate <kbps>    Target maximum bitrate in kbps
+    -p, --profile <name|path>
+                            Load settings from a TOML profile (see profiles/example.toml).
+                            A bare name is looked up in ./profiles next to this script,
+                            then ~/.config/media-archiver/profiles. CLI flags override it.
+    --max-bitrate <kbps>    Absolute maximum bitrate in kbps, for every resolution
+    --ref-bitrate <kbps@res>
+                            Reference bitrate at a resolution, e.g. 6000@1080p. Each
+                            file's limit is scaled by (output pixels / reference pixels)^0.75
     --max-resolution <res>  Maximum resolution, e.g. 1080p, 4k, or 1920x1080.
                             The aspect ratio is kept and the box follows the
                             video's orientation (1920x1080 box for landscape,
                             1080x1920 for portrait). Never upscales.
-                            (at least one of --max-bitrate / --max-resolution is required)
+                            (at least one bitrate limit or --max-resolution is required)
     --min-saving <percent>  Skip files whose estimated saving is below this percentage
     --output-dir <path>     Output directory (default: replace originals in place)
     --recursive             Process subdirectories recursively
@@ -34,15 +46,19 @@ Examples:
     python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --execute
     python video_transcode.py ~/Videos --max-resolution 1280x720 --min-saving 20
     python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --execute
+    python video_transcode.py ~/Videos --ref-bitrate 6000@1080p --max-resolution 1440p
+    python video_transcode.py ~/Videos -p archive --min-saving 25
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # -- Supported extensions -----------------------------------------------------
@@ -60,6 +76,17 @@ DURATION_TOLERANCE_SEC = 1.0
 
 # Assumed bitrate for audio streams that report none (common in mkv/avi).
 DEFAULT_AUDIO_KBPS = 128.0
+
+# Bitrate needed for equal quality grows slower than pixel count: 4x the pixels
+# needs well under 4x the bitrate. 0.7-0.8 is the usual rule of thumb for HEVC.
+DEFAULT_BITRATE_EXPONENT = 0.75
+DEFAULT_FPS_EXPONENT = 0.5
+
+# Where a bare --profile name is looked up, in order.
+PROFILE_DIRS = [
+    Path(__file__).resolve().parent / "profiles",
+    Path.home() / ".config" / "media-archiver" / "profiles",
+]
 
 # -- Tool detection -----------------------------------------------------------
 
@@ -119,13 +146,22 @@ def _stream_rotation(stream: dict) -> int:
     except (TypeError, ValueError):
         return 0
 
+def _parse_rate(text: str | None) -> float | None:
+    """'30000/1001' -> 29.97; None for missing or degenerate values like '0/0'."""
+    try:
+        num, _, den = (text or "").partition("/")
+        value = float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return value if value > 0 else None
+
 def probe_streams(ffprobe: str, filepath: Path) -> dict:
     """
-    Return {"width", "height", "audio_kbps"}. width/height are the *display*
+    Return {"width", "height", "fps", "audio_kbps"}. width/height are the *display*
     dimensions (rotation applied) of the first video stream, or None on failure.
     audio_kbps is the summed bitrate of all audio streams.
     """
-    info = {"width": None, "height": None, "audio_kbps": 0.0}
+    info = {"width": None, "height": None, "fps": None, "audio_kbps": 0.0}
     cmd = [
         ffprobe, "-v", "quiet",
         "-print_format", "json",
@@ -148,6 +184,8 @@ def probe_streams(ffprobe: str, filepath: Path) -> dict:
                 if _stream_rotation(s) in (90, 270):
                     w, h = h, w
                 info["width"], info["height"] = int(w), int(h)
+                info["fps"] = (_parse_rate(s.get("avg_frame_rate"))
+                               or _parse_rate(s.get("r_frame_rate")))
         elif kind == "audio":
             br = s.get("bit_rate")
             info["audio_kbps"] += float(br) / 1000 if br else DEFAULT_AUDIO_KBPS
@@ -196,6 +234,176 @@ def fit_within(width: int, height: int, box: tuple[int, int]) -> tuple[int, int]
     new_h = max(2, int(height * scale) // 2 * 2)
     return new_w, new_h
 
+# -- Bitrate limit ------------------------------------------------------------
+
+@dataclass
+class BitratePolicy:
+    """
+    Per-file bitrate limit. With no points the limit is simply `cap` (fixed mode).
+    With points (pixels, kbps, label) it is scaled to the output pixel count:
+      - one point:  kbps * (pixels / ref_pixels) ^ exponent
+      - a table:    interpolated in log-log space (a piecewise power curve),
+                    extrapolated past either end with the nearest segment's slope
+    then multiplied by (fps / fps_ref) ^ fps_exponent when fps_ref is set, and
+    finally clamped to `cap`.
+    """
+    cap: float | None = None
+    points: list[tuple[int, float, str]] = field(default_factory=list)
+    exponent: float = DEFAULT_BITRATE_EXPONENT
+    fps_ref: float | None = None
+    fps_exponent: float = DEFAULT_FPS_EXPONENT
+
+    @property
+    def scaled(self) -> bool:
+        return bool(self.points)
+
+    def limit_for(self, pixels: int | None, fps: float | None) -> float | None:
+        if not self.points or not pixels:
+            return self.cap
+        if len(self.points) == 1:
+            p0, k0, _ = self.points[0]
+            kbps = k0 * (pixels / p0) ** self.exponent
+        else:
+            pts = self.points
+            i = 0
+            while i < len(pts) - 2 and pixels > pts[i + 1][0]:
+                i += 1
+            (pa, ka, _), (pb, kb, _) = pts[i], pts[i + 1]
+            slope = math.log(kb / ka) / math.log(pb / pa)
+            kbps = ka * (pixels / pa) ** slope
+        if self.fps_ref and fps:
+            kbps *= (fps / self.fps_ref) ** self.fps_exponent
+        if self.cap is not None:
+            kbps = min(kbps, self.cap)
+        return kbps
+
+def _resolution_point(res: str, kbps: float) -> tuple[int, float, str]:
+    long_side, short_side = parse_max_resolution(res)
+    if kbps <= 0:
+        raise ValueError(f"bitrate for {res} must be positive")
+    label = f"{long_side}x{short_side}"
+    if res.strip().lower() != label:
+        label = f"{res.strip()} ({label})"
+    return long_side * short_side, float(kbps), label
+
+def parse_ref_bitrate(text: str) -> tuple[int, float, str]:
+    """'6000@1080p' -> (pixels, 6000.0, '1920x1080')."""
+    kbps, sep, res = text.partition("@")
+    try:
+        if not sep:
+            raise ValueError
+        value = float(kbps)
+    except ValueError:
+        raise ValueError(f"invalid reference bitrate '{text}' (use <kbps>@<res>, e.g. 6000@1080p)")
+    return _resolution_point(res, value)
+
+def parse_bitrate_table(table: dict) -> list[tuple[int, float, str]]:
+    """{'720p': 3500, '1080p': 6000, ...} -> points sorted by pixel count."""
+    points = []
+    for res, kbps in table.items():
+        if isinstance(kbps, bool) or not isinstance(kbps, (int, float)):
+            raise ValueError(f"bitrate for '{res}' must be a number")
+        points.append(_resolution_point(res, kbps))
+    points.sort()
+    for (pa, ka, la), (pb, kb, lb) in zip(points, points[1:]):
+        if pa == pb:
+            raise ValueError(f"'{la}' and '{lb}' have the same pixel count")
+        if kb < ka:
+            raise ValueError(f"bitrate must not decrease with resolution ({la}: {ka:g} > {lb}: {kb:g})")
+    return points
+
+# -- Profiles -----------------------------------------------------------------
+
+class ProfileError(ValueError):
+    pass
+
+_NUMBER = (int, float)
+_TABLE = "table"   # free-form resolution -> kbps mapping, validated separately
+
+# Every key a profile may contain. Unknown keys are rejected so that a typo
+# never silently falls back to a default -- in place mode deletes originals.
+PROFILE_SCHEMA = {
+    "max_resolution": str,
+    "min_saving": _NUMBER,
+    "bitrate": {
+        "max": _NUMBER,
+        "reference": str,
+        "exponent": _NUMBER,
+        "table": _TABLE,
+        "fps": {"reference": _NUMBER, "exponent": _NUMBER},
+    },
+}
+
+def _check_schema(data: dict, schema: dict, where: str = ""):
+    for key, value in data.items():
+        path = f"{where}.{key}" if where else key
+        if key not in schema:
+            raise ProfileError(f"unknown key '{path}' (allowed here: {', '.join(schema)})")
+        expected = schema[key]
+        if isinstance(expected, dict) or expected == _TABLE:
+            if not isinstance(value, dict):
+                raise ProfileError(f"'{path}' must be a table")
+            if isinstance(expected, dict):
+                _check_schema(value, expected, path)
+        elif isinstance(value, bool) or not isinstance(value, expected):
+            kind = "a number" if expected is _NUMBER else "a string"
+            raise ProfileError(f"'{path}' must be {kind}")
+
+def find_profile(name: str) -> Path:
+    """A path to an existing file, or a bare name looked up in PROFILE_DIRS."""
+    direct = Path(name).expanduser()
+    if direct.is_file():
+        return direct
+    if direct.parent == Path("."):
+        filename = name if name.endswith(".toml") else f"{name}.toml"
+        for d in PROFILE_DIRS:
+            if (d / filename).is_file():
+                return d / filename
+    searched = "\n".join(f"          {d}" for d in PROFILE_DIRS)
+    print(f"[ERROR] Profile not found: {name}\n        Searched:\n{searched}")
+    sys.exit(1)
+
+def load_profile(path: Path) -> dict:
+    """Read and validate a TOML profile; return its settings keyed by argparse dest."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        raise ProfileError("profiles require Python 3.11+ (tomllib)")
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        raise ProfileError(f"invalid TOML: {e}")
+
+    _check_schema(data, PROFILE_SCHEMA)
+    bitrate = data.get("bitrate", {})
+    fps = bitrate.get("fps", {})
+    if "reference" in bitrate and "table" in bitrate:
+        raise ProfileError("use either 'bitrate.reference' or 'bitrate.table', not both")
+    if fps and "reference" not in fps:
+        raise ProfileError("'bitrate.fps.reference' is required when [bitrate.fps] is present")
+
+    table = None
+    if "table" in bitrate:
+        try:
+            table = parse_bitrate_table(bitrate["table"])
+        except ValueError as e:
+            raise ProfileError(f"bitrate.table: {e}")
+        if not table:
+            raise ProfileError("'bitrate.table' is empty")
+
+    settings = {
+        "max_resolution":   data.get("max_resolution"),
+        "min_saving":       data.get("min_saving"),
+        "max_bitrate":      bitrate.get("max"),
+        "ref_bitrate":      bitrate.get("reference"),
+        "bitrate_exponent": bitrate.get("exponent"),
+        "bitrate_table":    table,
+        "fps_ref":          fps.get("reference"),
+        "fps_exponent":     fps.get("exponent"),
+    }
+    return {k: v for k, v in settings.items() if v is not None}
+
 # -- Formatting ---------------------------------------------------------------
 
 def fmt_size(num_bytes: float) -> str:
@@ -232,7 +440,7 @@ def collect_files(folder: Path, recursive: bool, output_dir: Path | None) -> lis
 def build_plan(
     files: list[Path],
     ffprobe: str,
-    max_bitrate: float | None,
+    policy: BitratePolicy,
     max_resolution: tuple[int, int] | None,
     min_saving: float | None,
     output_dir: Path | None,
@@ -248,8 +456,10 @@ def build_plan(
         "duration":       float | None,        # seconds
         "size":           int | None,          # bytes
         "width"/"height": int | None,          # display dimensions
+        "fps":            float | None,
         "action":         "transcode" | "skip" | "low_saving" | "probe_failed",
         "output":         Path | None,
+        "limit":          float | None,        # this file's bitrate limit (kbps)
         "target_bitrate": float | None,        # kbps passed to the encoder
         "box":            (w, h) | None,       # resolution limit box, set only when scaling
         "scale_to":       (w, h) | None,       # expected output resolution
@@ -279,8 +489,10 @@ def build_plan(
             "size": size,
             "width": None,
             "height": None,
+            "fps": None,
             "action": "skip",
             "output": None,
+            "limit": None,
             "target_bitrate": None,
             "box": None,
             "scale_to": None,
@@ -293,25 +505,38 @@ def build_plan(
             continue
 
         streams = probe_streams(ffprobe, filepath)
-        w, h = streams["width"], streams["height"]
-        entry["width"], entry["height"] = w, h
+        w, h, fps = streams["width"], streams["height"], streams["fps"]
+        entry["width"], entry["height"], entry["fps"] = w, h, fps
+
+        # A resolution-scaled limit is meaningless without the dimensions.
+        if policy.scaled and not (w and h):
+            entry["action"] = "probe_failed"
+            plan.append(entry)
+            continue
 
         box = scale_to = None
         if max_resolution and w and h:
             box = box_for(w, h, max_resolution)
             scale_to = fit_within(w, h, box)
 
-        over_bitrate = max_bitrate is not None and bitrate > max_bitrate
+        # The limit follows the *output* resolution: a 4K file downscaled to
+        # 1440p gets the 1440p budget.
+        out_w, out_h = scale_to or (w, h)
+        limit = policy.limit_for(out_w * out_h if w and h else None, fps)
+        entry["limit"] = limit
+
+        over_bitrate = limit is not None and bitrate > limit
         if not over_bitrate and scale_to is None:
             plan.append(entry)   # action stays "skip"
             continue
 
-        # Target bitrate: never raise it above what the source already has.
-        # Resolution-only runs scale the source bitrate by the pixel ratio.
-        if max_bitrate is not None:
-            target = min(max_bitrate, bitrate)
-        else:
-            target = bitrate * (scale_to[0] * scale_to[1]) / (w * h)
+        # Target: the limit, but never more than the source carries. When
+        # downscaling, the source bitrate is first adjusted to the smaller
+        # frame along the same pixels^exponent curve.
+        source_equiv = bitrate
+        if scale_to:
+            source_equiv *= ((scale_to[0] * scale_to[1]) / (w * h)) ** policy.exponent
+        target = source_equiv if limit is None else min(limit, source_equiv)
         target = max(target, 1.0)
 
         entry["target_bitrate"] = target
@@ -372,31 +597,69 @@ def _describe(e: dict) -> str:
     parts = [f"{e['bitrate']:.0f} kbps"]
     if e["width"] and e["height"]:
         parts.append(f"{e['width']}x{e['height']}")
+    if e["fps"]:
+        parts.append(f"{e['fps']:.3g} fps")
     if e["size"] is not None:
         parts.append(fmt_size(e["size"]))
+    if e["limit"] is not None:
+        parts.append(f"limit {e['limit']:.0f} kbps")
     return ", ".join(parts)
+
+def describe_policy(policy: BitratePolicy, sources: dict[str, str]) -> list[str]:
+    """Preview lines for the bitrate settings, tagged with where each came from."""
+    def tag(*keys: str) -> str:
+        return "  [profile]" if any(sources.get(k) == "profile" for k in keys) else ""
+
+    cap = f"{policy.cap:.0f} kbps{tag('max_bitrate')}" if policy.cap is not None else "(none)"
+    if not policy.scaled:
+        return [f"  max-bitrate    : {cap}"]
+
+    if len(policy.points) == 1:
+        _, kbps, label = policy.points[0]
+        lines = [f"  ref-bitrate    : {kbps:.0f} kbps @ {label}{tag('ref_bitrate')}",
+                 f"  scaling        : (pixels / reference)^{policy.exponent:g}"
+                 f"{tag('bitrate_exponent')}"]
+    else:
+        lines = [f"  bitrate table  : (log-log interpolated){tag('bitrate_table')}"]
+        width = max(len(label) for _, _, label in policy.points)
+        lines += [f"                     {label:<{width}} : {kbps:.0f} kbps"
+                  for _, kbps, label in policy.points]
+    if policy.fps_ref:
+        lines.append(f"  fps scaling    : (fps / {policy.fps_ref:g})^{policy.fps_exponent:g}"
+                     f"{tag('fps_ref', 'fps_exponent')}")
+    lines.append(f"  max-bitrate    : {cap}")
+    return lines
 
 def print_preview(
     plan: list[dict],
-    max_bitrate: float | None,
+    policy: BitratePolicy,
     max_resolution: tuple[int, int] | None,
     min_saving: float | None,
     output_dir: Path | None,
+    sources: dict[str, str] | None = None,
+    profile_path: Path | None = None,
 ):
+    sources = sources or {}
     transcode  = [e for e in plan if e["action"] == "transcode"]
     skip       = [e for e in plan if e["action"] == "skip"]
     low_saving = [e for e in plan if e["action"] == "low_saving"]
     failed     = [e for e in plan if e["action"] == "probe_failed"]
 
+    def tag(key: str) -> str:
+        return "  [profile]" if sources.get(key) == "profile" else ""
+
     print(f"\n{'─'*72}")
-    print(f"  max-bitrate    : " + (f"{max_bitrate:.0f} kbps" if max_bitrate is not None else "(none)"))
+    if profile_path:
+        print(f"  profile        : {profile_path}")
+    for line in describe_policy(policy, sources):
+        print(line)
     if max_resolution:
         print(f"  max-resolution : {max_resolution[0]}x{max_resolution[1]} "
-              f"(orientation follows the video)")
+              f"(orientation follows the video){tag('max_resolution')}")
     else:
         print("  max-resolution : (none)")
     if min_saving is not None:
-        print(f"  min-saving     : {min_saving:g}%")
+        print(f"  min-saving     : {min_saving:g}%{tag('min_saving')}")
     if output_dir is None:
         print("  output-dir     : (none -- originals are replaced in place)")
     else:
@@ -453,7 +716,7 @@ def print_preview(
             print(f"    {e['path'].name}  [{_describe(e)}]")
 
     if failed:
-        print(f"\n  [WARN] Could not probe bitrate ({len(failed)}):\n")
+        print(f"\n  [WARN] Could not probe bitrate or resolution ({len(failed)}):\n")
         for e in failed:
             print(f"    {e['path'].name}")
 
@@ -698,8 +961,14 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("folder",          help="Folder containing video files")
+    parser.add_argument("-p", "--profile", metavar="NAME|PATH",
+                        help="TOML profile with transcoding settings (see profiles/example.toml); "
+                             "CLI flags override its values")
     parser.add_argument("--max-bitrate",   type=float, metavar="KBPS",
-                        help="Maximum bitrate in kbps; files above this are transcoded")
+                        help="Absolute maximum bitrate in kbps, applied at every resolution")
+    parser.add_argument("--ref-bitrate",   metavar="KBPS@RES",
+                        help="Reference bitrate at a resolution (e.g. 6000@1080p); each file's "
+                             "limit is scaled to its output resolution")
     parser.add_argument("--max-resolution", metavar="RES",
                         help="Maximum resolution (e.g. 1080p, 4k, 1920x1080); "
                              "aspect ratio kept, orientation follows the video, never upscales")
@@ -721,21 +990,68 @@ def main():
                         help="Postfix string appended to output filenames (default: empty)")
     parser.add_argument("--show-log",      action="store_true",
                         help="Stream HandBrakeCLI output directly to the terminal")
+    # Profile-only settings (no CLI flag)
+    parser.set_defaults(bitrate_exponent=None, bitrate_table=None,
+                        fps_ref=None, fps_exponent=None)
     args = parser.parse_args()
 
-    if args.max_bitrate is None and args.max_resolution is None:
-        parser.error("at least one of --max-bitrate / --max-resolution is required")
+    # Precedence: built-in defaults < profile < CLI flags.
+    sources: dict[str, str] = {}
+    profile_path = None
+    if args.profile:
+        profile_path = find_profile(args.profile)
+        try:
+            profile = load_profile(profile_path)
+        except ProfileError as e:
+            parser.error(f"profile {profile_path}: {e}")
+        for key, value in profile.items():
+            # --ref-bitrate on the CLI replaces the profile's table as well.
+            if key == "bitrate_table" and args.ref_bitrate is not None:
+                continue
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+                sources[key] = "profile"
+
+    def origin(key: str, flag: str, profile_key: str) -> str:
+        """Name a setting the way the user wrote it, for error messages."""
+        return f"'{profile_key}' in profile" if sources.get(key) == "profile" else flag
+
+    if (args.max_bitrate is None and args.ref_bitrate is None
+            and args.bitrate_table is None and args.max_resolution is None):
+        parser.error("at least one of --max-bitrate / --ref-bitrate / --max-resolution "
+                     "(or a profile setting them) is required")
     if args.max_bitrate is not None and args.max_bitrate <= 0:
-        parser.error("--max-bitrate must be positive")
+        parser.error(f"{origin('max_bitrate', '--max-bitrate', 'bitrate.max')} must be positive")
     if args.min_saving is not None and not (0 <= args.min_saving < 100):
-        parser.error("--min-saving must be between 0 and 100")
+        parser.error(f"{origin('min_saving', '--min-saving', 'min_saving')} must be between 0 and 100")
+    if args.bitrate_exponent is not None and args.bitrate_exponent <= 0:
+        parser.error("bitrate.exponent must be positive")
+    if args.fps_ref is not None and args.fps_ref <= 0:
+        parser.error("bitrate.fps.reference must be positive")
+    if args.fps_exponent is not None and args.fps_exponent < 0:
+        parser.error("bitrate.fps.exponent must not be negative")
+
+    policy = BitratePolicy(cap=args.max_bitrate, fps_ref=args.fps_ref)
+    if args.bitrate_exponent is not None:
+        policy.exponent = args.bitrate_exponent
+    if args.fps_exponent is not None:
+        policy.fps_exponent = args.fps_exponent
+    if args.ref_bitrate is not None:
+        try:
+            policy.points = [parse_ref_bitrate(args.ref_bitrate)]
+        except ValueError as e:
+            parser.error(f"{origin('ref_bitrate', '--ref-bitrate', 'bitrate.reference')}: {e}")
+    elif args.bitrate_table is not None:
+        policy.points = args.bitrate_table
+    if policy.fps_ref and not policy.scaled:
+        parser.error("bitrate.fps needs a scaled limit (--ref-bitrate, bitrate.reference or bitrate.table)")
 
     max_resolution = None
     if args.max_resolution:
         try:
             max_resolution = parse_max_resolution(args.max_resolution)
         except ValueError as e:
-            parser.error(str(e))
+            parser.error(f"{origin('max_resolution', '--max-resolution', 'max_resolution')}: {e}")
 
     # Resolve tools
     handbrake = find_tool("HandBrakeCLI", args.handbrake)
@@ -760,11 +1076,12 @@ def main():
 
     # Build plan
     print(f"Probing {len(files)} file(s)...")
-    plan = build_plan(files, ffprobe, args.max_bitrate, max_resolution, args.min_saving,
+    plan = build_plan(files, ffprobe, policy, max_resolution, args.min_saving,
                       output_dir, folder, args.recursive, args.postfix)
 
     # Show preview
-    print_preview(plan, args.max_bitrate, max_resolution, args.min_saving, output_dir)
+    print_preview(plan, policy, max_resolution, args.min_saving, output_dir,
+                  sources, profile_path)
 
     # Dry run: print commands and exit
     if args.dry_run:

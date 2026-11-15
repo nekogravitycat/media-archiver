@@ -60,7 +60,7 @@ python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --exe
 
 ## video_transcode.py
 
-Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds `--max-bitrate` and/or whose resolution exceeds `--max-resolution` are transcoded; others are skipped. Audio tracks are copied without re-encoding. The preview shows the estimated output size and saving for each file, and `--min-saving` can skip files that would not shrink enough.
+Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds their bitrate limit and/or whose resolution exceeds `--max-resolution` are transcoded; others are skipped. The limit can be fixed (`--max-bitrate`) or scaled to each file's resolution (`--ref-bitrate`, or a table in a [profile](#profiles)), so 1080p and 1440p files in the same run each get an appropriate budget. Audio tracks are copied without re-encoding. The preview shows the estimated output size and saving for each file, and `--min-saving` can skip files that would not shrink enough.
 
 By default the originals are **replaced in place**, and each one is deleted only after its replacement has been verified — see [In-place replacement](#in-place-replacement-no---output-dir). Pass `--output-dir` to write elsewhere and leave the originals untouched.
 
@@ -70,7 +70,7 @@ By default the originals are **replaced in place**, and each one is deleted only
 - [FFmpeg](https://ffmpeg.org/) (provides `ffprobe`)
 - An NVIDIA GPU with NVENC support
 
-Both `HandBrakeCLI` and `ffprobe` must be available in `PATH`, or their paths supplied via `--handbrake`.
+Both `HandBrakeCLI` and `ffprobe` must be available in `PATH`, or their paths supplied via `--handbrake`. Profiles (`-p`) need Python 3.11+.
 
 ### Supported formats
 
@@ -79,14 +79,16 @@ Both `HandBrakeCLI` and `ffprobe` must be available in `PATH`, or their paths su
 ### Usage
 
 ```
-python video_transcode.py <folder> [--max-bitrate <kbps>] [--max-resolution <res>] [options]
+python video_transcode.py <folder> [-p <profile>] [--max-bitrate <kbps>] [--ref-bitrate <kbps@res>] [--max-resolution <res>] [options]
 ```
 
-At least one of `--max-bitrate` / `--max-resolution` is required.
+At least one of `--max-bitrate` / `--ref-bitrate` / `--max-resolution` is required, either as a flag or from a profile.
 
 | Option                   | Description                                                                                                  |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `--max-bitrate <kbps>`   | Files above this bitrate are transcoded                                                                      |
+| `-p, --profile <name>`   | Load settings from a TOML profile (see [Profiles](#profiles)); flags override it                             |
+| `--max-bitrate <kbps>`   | Absolute bitrate limit at every resolution; files above it are transcoded                                    |
+| `--ref-bitrate <kbps@res>` | Reference bitrate, e.g. `6000@1080p`; each file's limit is scaled to its output resolution (see [below](#resolution-scaled-bitrate)) |
 | `--max-resolution <res>` | Files larger than this are scaled down, e.g. `1080p`, `4k`, `1920x1080` (see [below](#resolution-limiting)) |
 | `--min-saving <percent>` | Skip files whose estimated saving is below this percentage (0–100)                                           |
 | `--output-dir <path>`    | Output directory (default: replace the originals in place)                                                   |
@@ -118,6 +120,12 @@ python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --e
 
 # Resolution only, skipping files that would save less than 20%
 python video_transcode.py ~/Videos --max-resolution 1280x720 --min-saving 20
+
+# Mixed FHD / 2K / 4K library capped at 1440p; 1080p files get ~6000 kbps, 1440p ~9200 kbps
+python video_transcode.py ~/Videos --ref-bitrate 6000@1080p --max-resolution 1440p
+
+# Use profiles/archive.toml, overriding one of its values
+python video_transcode.py ~/Videos -p archive --min-saving 25
 ```
 
 Output files mirror the source folder structure when `--recursive` is used. Naming conflicts are resolved automatically by appending `_2`, `_3`, etc.
@@ -127,15 +135,66 @@ Output files mirror the source folder structure when `--recursive` is used. Nami
 `--max-resolution` accepts `<N>p` (16:9 box with N as the short side, e.g. `1080p` = 1920x1080), `4k` / `uhd` (2160p), `8k` (4320p), or an explicit `<W>x<H>`.
 
 - The aspect ratio is kept, and the box follows the video's orientation (1920x1080 for landscape, 1080x1920 for portrait). Rotation metadata is taken into account.
-- Videos are **never upscaled**; those already within the limit are skipped (unless they exceed `--max-bitrate`).
+- Videos are **never upscaled**; those already within the limit are skipped (unless they exceed their bitrate limit).
 - Output dimensions are rounded down to even numbers.
+
+### Resolution-scaled bitrate
+
+At the same quality, a 1080p video needs less bitrate than a 1440p one, so a single fixed `--max-bitrate` is either too generous for the smaller files or too tight for the larger ones. `--ref-bitrate <kbps>@<res>` sets the limit at one reference resolution and scales it to each file:
+
+```
+limit = kbps × (output pixels / reference pixels) ^ 0.75
+```
+
+The exponent is below 1 because the bitrate needed for equal quality grows more slowly than the pixel count. With `6000@1080p` that gives 720p ≈ 3300, 1080p = 6000, 1440p ≈ 9200, 4K ≈ 17000 kbps.
+
+- The limit uses the **output** resolution: a 4K file downscaled by `--max-resolution 1440p` gets the 1440p budget.
+- `--max-bitrate` still applies as an absolute ceiling on top.
+- A profile can instead give an explicit table of resolution → kbps (interpolated between points), change the exponent, and add a frame-rate adjustment. See [Profiles](#profiles).
 
 ### Target bitrate and size estimate
 
-- With `--max-bitrate`, the encoder targets `min(max-bitrate, source bitrate)` — the bitrate is never raised above the source's.
-- With `--max-resolution` only, the target is the source bitrate scaled by the pixel-count ratio of the new resolution.
+- The encoder targets `min(limit, source bitrate)`, so the bitrate is never raised above the source's. When a file is downscaled, the source bitrate is first scaled to the smaller frame along the same `pixels ^ exponent` curve.
+- With `--max-resolution` only (no bitrate limit), the target is that scaled source bitrate.
 - The preview estimates each output as `duration × (target video bitrate + audio bitrate)`. This is an approximation; NVENC often lands at or below the target. Audio streams reporting no bitrate are assumed to be 128 kbps.
 - `--min-saving <percent>` skips files whose estimated saving falls below the threshold; they are listed separately in the preview.
+
+### Profiles
+
+A profile is a TOML file that holds transcoding settings, so everyday runs can stay short while detailed tuning lives in a file. Start from the documented template:
+
+```bash
+cp profiles/example.toml profiles/archive.toml
+python video_transcode.py ~/Videos -p archive
+```
+
+`-p` accepts a path, or a bare name looked up as `<name>.toml` in `profiles/` next to the script, then in `~/.config/media-archiver/profiles/`. Only `profiles/example.toml` is tracked by git; your own profiles are ignored.
+
+```toml
+max_resolution = "1440p"     # --max-resolution
+min_saving     = 15          # --min-saving
+
+[bitrate]
+max       = 20000            # --max-bitrate (absolute ceiling)
+reference = "6000@1080p"     # --ref-bitrate
+exponent  = 0.75             # scaling exponent (default 0.75)
+
+# Instead of `reference`, an explicit table, interpolated on a log-log curve:
+# [bitrate.table]
+# "720p"  = 3500
+# "1080p" = 6000
+# "1440p" = 10000
+
+# Optional frame-rate adjustment: limit *= (fps / reference) ^ exponent
+# [bitrate.fps]
+# reference = 30
+# exponent  = 0.5
+```
+
+- Precedence is built-in defaults < profile < command-line flags. `--ref-bitrate` on the command line also replaces a profile's `[bitrate.table]`.
+- Unknown keys and wrong types are rejected, so a typo fails instead of silently falling back to a default.
+- Per-run choices (`--execute`, `--output-dir`, `--recursive`, `--postfix`, …) cannot be set in a profile.
+- The preview shows the effective settings and marks the ones that came from the profile with `[profile]`. Each file's line shows its own computed limit.
 
 ### In-place replacement (no `--output-dir`)
 
