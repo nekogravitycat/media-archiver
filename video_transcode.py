@@ -36,16 +36,16 @@ Options:
     --min-saving <percent>  Skip files whose estimated saving is below this percentage
     --output-dir <path>     Output directory (default: replace originals in place)
     --recursive             Process subdirectories recursively
-    --execute               Apply transcoding (default: preview only)
-    --dry-run               Print the exact HandBrakeCLI commands without running them
+    --yes, -y               Skip the confirmation prompt and start transcoding
+    --dry-run               Preview and print the exact HandBrakeCLI commands without running them
     --skip-errors           Continue past files that fail
     --handbrake <path>      Path to HandBrakeCLI binary (default: auto-detect)
 
 Examples:
     python video_transcode.py ~/Videos --max-bitrate 8000
-    python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --execute
+    python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --yes
     python video_transcode.py ~/Videos --max-resolution 1280x720 --min-saving 20
-    python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --execute
+    python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --yes
     python video_transcode.py ~/Videos --ref-bitrate 6000@1080p --max-resolution 1440p
     python video_transcode.py ~/Videos -p archive --min-saving 25
 """
@@ -1029,10 +1029,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Output directory (default: replace the original files in place)")
     parser.add_argument("--recursive",     action="store_true",
                         help="Process subdirectories recursively")
-    parser.add_argument("--execute",       action="store_true",
-                        help="Apply transcoding (default: preview only)")
-    parser.add_argument("--dry-run",       action="store_true",
-                        help="Print the exact HandBrakeCLI commands without running them")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--yes", "-y",       action="store_true",
+                      help="Skip the confirmation prompt and start transcoding")
+    mode.add_argument("--dry-run",         action="store_true",
+                      help="Preview and print the exact HandBrakeCLI commands without running them")
     parser.add_argument("--skip-errors",   action="store_true",
                         help="Continue past files that fail")
     parser.add_argument("--handbrake",     metavar="PATH",
@@ -1086,22 +1087,19 @@ def main():
 
     # Execute or prompt
     to_do = sum(1 for e in plan if e.action == "transcode")
-    if not args.execute:
-        if to_do > 0:
-            print("Preview mode. Add --execute to start transcoding.\n")
-        return
     if to_do == 0:
         print("No files need transcoding. Nothing to do.\n")
         return
-    if in_place:
-        prompt = (f"Transcode {to_do} file(s) IN PLACE? "
-                  f"Each original is deleted once its replacement is verified. [y/N] ")
-    else:
-        prompt = f"Transcode {to_do} file(s)? [y/N] "
-    if input(prompt).strip().lower() == "y":
-        execute_plan(plan, handbrake, ffprobe, args.skip_errors, in_place, args.show_log)
-    else:
-        print("Cancelled.\n")
+    if not args.yes:
+        if in_place:
+            prompt = (f"Transcode {to_do} file(s) IN PLACE? "
+                      f"Each original is deleted once its replacement is verified. [y/N] ")
+        else:
+            prompt = f"Transcode {to_do} file(s)? [y/N] "
+        if input(prompt).strip().lower() != "y":
+            print("Cancelled.\n")
+            return
+    execute_plan(plan, handbrake, ffprobe, args.skip_errors, in_place, args.show_log)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,8 @@ python media_date_rename.py <folder> [options]
 
 | Option               | Description                                              |
 | -------------------- | -------------------------------------------------------- |
-| `--execute`          | Apply the renames (default: preview only)                |
+| `-y, --yes`          | Skip the confirmation prompt and apply the renames       |
+| `--dry-run`          | Show the preview only; never prompt or rename            |
 | `--recursive`        | Process subdirectories recursively                       |
 | `--skip-errors`      | Skip files that cause errors instead of aborting         |
 | `--postfix <string>` | Append a string to output filenames before the extension |
@@ -46,14 +47,17 @@ python media_date_rename.py <folder> [options]
 ### Examples
 
 ```bash
-# Preview what would be renamed
+# Preview, then confirm interactively before renaming
 python media_date_rename.py ~/Pictures
 
-# Apply renames
-python media_date_rename.py ~/Pictures --execute
+# Preview only (no prompt, safe for scripts)
+python media_date_rename.py ~/Pictures --dry-run
+
+# Rename without asking for confirmation
+python media_date_rename.py ~/Pictures --yes
 
 # Rename recursively, appending a postfix to each filename
-python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --execute
+python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --yes
 ```
 
 ---
@@ -93,8 +97,8 @@ At least one of `--max-bitrate` / `--ref-bitrate` / `--max-resolution` is requir
 | `--min-saving <percent>` | Skip files whose estimated saving is below this percentage (0–100)                                           |
 | `--output-dir <path>`    | Output directory (default: replace the originals in place)                                                   |
 | `--recursive`          | Process subdirectories recursively                         |
-| `--execute`            | Apply transcoding (default: preview only)                  |
-| `--dry-run`            | Print the exact HandBrakeCLI commands without running them |
+| `-y, --yes`            | Skip the confirmation prompt and start transcoding         |
+| `--dry-run`            | Preview and print the exact HandBrakeCLI commands without running them (never prompts) |
 | `--skip-errors`        | Continue past files that fail                              |
 | `--handbrake <path>`   | Path to HandBrakeCLI binary (default: auto-detect)         |
 | `--postfix <string>`   | Append a string to output filenames (default: empty)       |
@@ -103,20 +107,20 @@ At least one of `--max-bitrate` / `--ref-bitrate` / `--max-resolution` is requir
 ### Examples
 
 ```bash
-# Preview which files exceed 8000 kbps
+# Preview files exceeding 8000 kbps, then confirm before replacing the originals in place
 python video_transcode.py ~/Videos --max-bitrate 8000
 
-# Replace the originals in place
-python video_transcode.py ~/Videos --max-bitrate 8000 --execute
+# Skip the confirmation prompt
+python video_transcode.py ~/Videos --max-bitrate 8000 --yes
 
 # Write to a separate output directory instead, leaving the originals alone
-python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --execute
+python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out --yes
 
-# Print the exact HandBrakeCLI commands that would run (no transcoding)
+# Preview only and print the exact HandBrakeCLI commands (no prompt, no transcoding)
 python video_transcode.py ~/Videos --max-bitrate 8000 --dry-run
 
 # Limit both bitrate and resolution
-python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --execute
+python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --yes
 
 # Resolution only, skipping files that would save less than 20%
 python video_transcode.py ~/Videos --max-resolution 1280x720 --min-saving 20
@@ -202,7 +206,7 @@ hdr_factor = 1.25            # limit multiplier for HDR sources (default 1)
 
 - Precedence is built-in defaults < profile < command-line flags. `--ref-bitrate` on the command line also replaces a profile's `[bitrate.table]`.
 - Unknown keys and wrong types are rejected, so a typo fails instead of silently falling back to a default.
-- Per-run choices (`--execute`, `--output-dir`, `--recursive`, `--postfix`, …) cannot be set in a profile.
+- Per-run choices (`--yes`, `--dry-run`, `--output-dir`, `--recursive`, `--postfix`, …) cannot be set in a profile.
 - The preview shows the effective settings and marks the ones that came from the profile with `[profile]`. Each file's line shows its own computed limit.
 
 ### In-place replacement (no `--output-dir`)

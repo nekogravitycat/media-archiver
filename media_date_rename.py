@@ -6,8 +6,9 @@ Usage:
     python media_archiver.py <folder> [options]
 
 Options:
-    --execute       Apply the renames (default: preview only)
-    --recursive     Process subdirectories recursively
+    --yes, -y       Skip the confirmation prompt and apply the renames
+    --dry-run       Show the preview only; never prompt or rename
+    --recursive    Process subdirectories recursively
     --skip-errors   Skip files that cause errors instead of aborting
 """
 
@@ -283,7 +284,11 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("folder", help="Path to the folder to process")
-    parser.add_argument("--execute", action="store_true", help="Apply renames (default: preview only)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--yes", "-y", action="store_true",
+                      help="Skip the confirmation prompt and apply the renames")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="Show the preview only; never prompt or rename")
     parser.add_argument("--recursive", action="store_true", help="Process subdirectories recursively")
     parser.add_argument("--skip-errors", action="store_true", help="Skip files that cause errors")
     parser.add_argument("--postfix", default="", help="String to append to output filenames before the extension")
@@ -308,16 +313,18 @@ def main():
 
     print_preview(plan, folder)
 
-    if not args.execute:
-        changed_count = sum(1 for o, n, _ in plan if o != n)
-        if changed_count > 0:
-            print("Preview mode. Add --execute to apply the renames.\n")
-    else:
-        confirm = input("Confirm rename? [y/N] ").strip().lower()
-        if confirm == "y":
-            execute_plan(plan, args.skip_errors)
-        else:
+    if args.dry_run:
+        return
+
+    changed_count = sum(1 for o, n, _ in plan if o != n)
+    if changed_count == 0:
+        return
+
+    if not args.yes:
+        if input("Confirm rename? [y/N] ").strip().lower() != "y":
             print("Cancelled.\n")
+            return
+    execute_plan(plan, args.skip_errors)
 
 
 if __name__ == "__main__":

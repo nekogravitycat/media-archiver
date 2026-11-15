@@ -7,7 +7,7 @@
 # Every key is optional. CLI flags override the values here. Unknown keys are
 # rejected, so a typo fails loudly instead of being ignored.
 #
-# Per-run choices (--execute, --output-dir, --recursive, --postfix, ...) are
+# Per-run choices (--yes, --dry-run, --output-dir, --recursive, --postfix, ...) are
 # deliberately not settable here.
 
 # Scale anything larger down to fit this box (orientation follows the video).
