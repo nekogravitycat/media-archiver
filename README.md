@@ -60,7 +60,7 @@ python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --exe
 
 ## video_transcode.py
 
-Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds `--max-bitrate` are transcoded; others are skipped. Audio tracks are copied without re-encoding.
+Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds `--max-bitrate` and/or whose resolution exceeds `--max-resolution` are transcoded; others are skipped. Audio tracks are copied without re-encoding. The preview shows the estimated output size and saving for each file, and `--min-saving` can skip files that would not shrink enough.
 
 By default the originals are **replaced in place**, and each one is deleted only after its replacement has been verified — see [In-place replacement](#in-place-replacement-no---output-dir). Pass `--output-dir` to write elsewhere and leave the originals untouched.
 
@@ -79,13 +79,17 @@ Both `HandBrakeCLI` and `ffprobe` must be available in `PATH`, or their paths su
 ### Usage
 
 ```
-python video_transcode.py <folder> --max-bitrate <kbps> [options]
+python video_transcode.py <folder> [--max-bitrate <kbps>] [--max-resolution <res>] [options]
 ```
 
-| Option                 | Description                                                |
-| ---------------------- | ---------------------------------------------------------- |
-| `--max-bitrate <kbps>` | Files above this bitrate are transcoded **(required)**     |
-| `--output-dir <path>`  | Output directory (default: replace the originals in place) |
+At least one of `--max-bitrate` / `--max-resolution` is required.
+
+| Option                   | Description                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `--max-bitrate <kbps>`   | Files above this bitrate are transcoded                                                                      |
+| `--max-resolution <res>` | Files larger than this are scaled down, e.g. `1080p`, `4k`, `1920x1080` (see [below](#resolution-limiting)) |
+| `--min-saving <percent>` | Skip files whose estimated saving is below this percentage (0–100)                                           |
+| `--output-dir <path>`    | Output directory (default: replace the originals in place)                                                   |
 | `--recursive`          | Process subdirectories recursively                         |
 | `--execute`            | Apply transcoding (default: preview only)                  |
 | `--dry-run`            | Print the exact HandBrakeCLI commands without running them |
@@ -108,9 +112,30 @@ python video_transcode.py ~/Videos --max-bitrate 8000 --output-dir ~/Videos/out 
 
 # Print the exact HandBrakeCLI commands that would run (no transcoding)
 python video_transcode.py ~/Videos --max-bitrate 8000 --dry-run
+
+# Limit both bitrate and resolution
+python video_transcode.py ~/Videos --max-bitrate 8000 --max-resolution 1080p --execute
+
+# Resolution only, skipping files that would save less than 20%
+python video_transcode.py ~/Videos --max-resolution 1280x720 --min-saving 20
 ```
 
 Output files mirror the source folder structure when `--recursive` is used. Naming conflicts are resolved automatically by appending `_2`, `_3`, etc.
+
+### Resolution limiting
+
+`--max-resolution` accepts `<N>p` (16:9 box with N as the short side, e.g. `1080p` = 1920x1080), `4k` / `uhd` (2160p), `8k` (4320p), or an explicit `<W>x<H>`.
+
+- The aspect ratio is kept, and the box follows the video's orientation (1920x1080 for landscape, 1080x1920 for portrait). Rotation metadata is taken into account.
+- Videos are **never upscaled**; those already within the limit are skipped (unless they exceed `--max-bitrate`).
+- Output dimensions are rounded down to even numbers.
+
+### Target bitrate and size estimate
+
+- With `--max-bitrate`, the encoder targets `min(max-bitrate, source bitrate)` — the bitrate is never raised above the source's.
+- With `--max-resolution` only, the target is the source bitrate scaled by the pixel-count ratio of the new resolution.
+- The preview estimates each output as `duration × (target video bitrate + audio bitrate)`. This is an approximation; NVENC often lands at or below the target. Audio streams reporting no bitrate are assumed to be 128 kbps.
+- `--min-saving <percent>` skips files whose estimated saving falls below the threshold; they are listed separately in the preview.
 
 ### In-place replacement (no `--output-dir`)
 
