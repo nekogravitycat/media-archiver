@@ -32,6 +32,10 @@ reference = "6000@1080p"
 # Also used to scale the source bitrate down when a file is downscaled.
 exponent = 0.75
 
+# Multiply the limit for HDR (HLG / HDR10) sources, which need more bitrate
+# than SDR. YouTube recommends ~1.25x. Requires option A or B. Default: 1.
+# hdr_factor = 1.25
+
 # --- Option B: explicit table (use instead of `reference`, not both) -------
 # Resolutions in between are interpolated on a log-log curve; beyond either
 # end the nearest segment's slope is extended. Bitrates must not decrease

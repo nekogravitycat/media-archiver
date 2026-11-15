@@ -159,6 +159,14 @@ The exponent is below 1 because the bitrate needed for equal quality grows more 
 - The preview estimates each output as `duration × (target video bitrate + audio bitrate)`. This is an approximation; NVENC often lands at or below the target. Audio streams reporting no bitrate are assumed to be 128 kbps.
 - `--min-saving <percent>` skips files whose estimated saving falls below the threshold; they are listed separately in the preview.
 
+### HDR
+
+HDR sources (HLG or HDR10/PQ, detected from the stream's transfer characteristics) are encoded with `nvenc_h265_10bit` as 10-bit Main10, so the BT.2020 color and HLG/PQ transfer signaling carry over. SDR sources keep the 8-bit `nvenc_h265` encoder.
+
+- HDR dynamic metadata is requested with `--hdr-dynamic-metadata all`, but as of HandBrake 1.11 the NVENC encoder drops Dolby Vision. iPhone Dolby Vision clips (profile 8.4) still play back as HLG HDR without it.
+- The preview shows the HDR type next to each HDR file.
+- HDR needs more bitrate than SDR for the same quality. A profile can set `bitrate.hdr_factor` (e.g. `1.25`, the HDR/SDR ratio in YouTube's recommendations) to raise the limit for HDR files. It needs a scaled limit, and `bitrate.max` still caps the result.
+
 ### Profiles
 
 A profile is a TOML file that holds transcoding settings, so everyday runs can stay short while detailed tuning lives in a file. Start from the documented template:
@@ -178,6 +186,7 @@ min_saving     = 15          # --min-saving
 max       = 20000            # --max-bitrate (absolute ceiling)
 reference = "6000@1080p"     # --ref-bitrate
 exponent  = 0.75             # scaling exponent (default 0.75)
+hdr_factor = 1.25            # limit multiplier for HDR sources (default 1)
 
 # Instead of `reference`, an explicit table, interpolated on a log-log curve:
 # [bitrate.table]

@@ -77,6 +77,9 @@ DURATION_TOLERANCE_SEC = 1.0
 # Assumed bitrate for audio streams that report none (common in mkv/avi).
 DEFAULT_AUDIO_KBPS = 128.0
 
+# ffprobe color_transfer values that mark an HDR stream.
+HDR_TRANSFERS = {"arib-std-b67": "HLG", "smpte2084": "HDR10"}
+
 # Bitrate needed for equal quality grows slower than pixel count: 4x the pixels
 # needs well under 4x the bitrate. 0.7-0.8 is the usual rule of thumb for HEVC.
 DEFAULT_BITRATE_EXPONENT = 0.75
@@ -154,13 +157,24 @@ def _parse_rate(text: str | None) -> float | None:
         return None
     return value if value > 0 else None
 
+def _hdr_label(stream: dict) -> str | None:
+    """'HLG' / 'HDR10' plus ' + Dolby Vision' for an HDR video stream, else None."""
+    kind = HDR_TRANSFERS.get(stream.get("color_transfer") or "")
+    if kind is None:
+        return None
+    if any("DOVI" in (sd.get("side_data_type") or "")
+           for sd in stream.get("side_data_list") or []):
+        kind += " + Dolby Vision"
+    return kind
+
 def parse_streams(probe: dict) -> dict:
     """
-    Return {"width", "height", "fps", "audio_kbps"} from ffprobe output.
+    Return {"width", "height", "fps", "hdr", "audio_kbps"} from ffprobe output.
     width/height are the *display* dimensions (rotation applied) of the first
-    video stream, or None when absent. audio_kbps sums all audio streams.
+    video stream, or None when absent. hdr is a label such as 'HLG' when that
+    stream is HDR, else None. audio_kbps sums all audio streams.
     """
-    info = {"width": None, "height": None, "fps": None, "audio_kbps": 0.0}
+    info = {"width": None, "height": None, "fps": None, "hdr": None, "audio_kbps": 0.0}
     for s in probe.get("streams", []):
         kind = s.get("codec_type")
         if kind == "video" and info["width"] is None:
@@ -173,6 +187,7 @@ def parse_streams(probe: dict) -> dict:
                 info["width"], info["height"] = int(w), int(h)
                 info["fps"] = (_parse_rate(s.get("avg_frame_rate"))
                                or _parse_rate(s.get("r_frame_rate")))
+                info["hdr"] = _hdr_label(s)
         elif kind == "audio":
             br = s.get("bit_rate")
             info["audio_kbps"] += float(br) / 1000 if br else DEFAULT_AUDIO_KBPS
@@ -231,20 +246,22 @@ class BitratePolicy:
       - one point:  kbps * (pixels / ref_pixels) ^ exponent
       - a table:    interpolated in log-log space (a piecewise power curve),
                     extrapolated past either end with the nearest segment's slope
-    then multiplied by (fps / fps_ref) ^ fps_exponent when fps_ref is set, and
-    finally clamped to `cap`.
+    then multiplied by (fps / fps_ref) ^ fps_exponent when fps_ref is set and
+    by hdr_factor for HDR sources, and finally clamped to `cap`.
     """
     cap: float | None = None
     points: list[tuple[int, float, str]] = field(default_factory=list)
     exponent: float = DEFAULT_BITRATE_EXPONENT
     fps_ref: float | None = None
     fps_exponent: float = DEFAULT_FPS_EXPONENT
+    hdr_factor: float = 1.0
 
     @property
     def scaled(self) -> bool:
         return bool(self.points)
 
-    def limit_for(self, pixels: int | None, fps: float | None) -> float | None:
+    def limit_for(self, pixels: int | None, fps: float | None,
+                  hdr: bool = False) -> float | None:
         if not self.points or not pixels:
             return self.cap
         if len(self.points) == 1:
@@ -260,6 +277,8 @@ class BitratePolicy:
             kbps = ka * (pixels / pa) ** slope
         if self.fps_ref and fps:
             kbps *= (fps / self.fps_ref) ** self.fps_exponent
+        if hdr:
+            kbps *= self.hdr_factor
         if self.cap is not None:
             kbps = min(kbps, self.cap)
         return kbps
@@ -316,6 +335,7 @@ PROFILE_SCHEMA = {
         "max": _NUMBER,
         "reference": str,
         "exponent": _NUMBER,
+        "hdr_factor": _NUMBER,
         "table": _TABLE,
         "fps": {"reference": _NUMBER, "exponent": _NUMBER},
     },
@@ -386,6 +406,7 @@ def load_profile(path: Path) -> dict:
         "ref_bitrate":      bitrate.get("reference"),
         "bitrate_exponent": bitrate.get("exponent"),
         "bitrate_table":    table,
+        "hdr_factor":       bitrate.get("hdr_factor"),
         "fps_ref":          fps.get("reference"),
         "fps_exponent":     fps.get("exponent"),
     }
@@ -439,12 +460,16 @@ def resolve_config(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("bitrate.fps.reference must be positive")
     if args.fps_exponent is not None and args.fps_exponent < 0:
         parser.error("bitrate.fps.exponent must not be negative")
+    if args.hdr_factor is not None and args.hdr_factor <= 0:
+        parser.error("bitrate.hdr_factor must be positive")
 
     policy = BitratePolicy(cap=args.max_bitrate, fps_ref=args.fps_ref)
     if args.bitrate_exponent is not None:
         policy.exponent = args.bitrate_exponent
     if args.fps_exponent is not None:
         policy.fps_exponent = args.fps_exponent
+    if args.hdr_factor is not None:
+        policy.hdr_factor = args.hdr_factor
     if args.ref_bitrate is not None:
         try:
             policy.points = [parse_ref_bitrate(args.ref_bitrate)]
@@ -454,6 +479,8 @@ def resolve_config(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         policy.points = args.bitrate_table
     if policy.fps_ref and not policy.scaled:
         parser.error("bitrate.fps needs a scaled limit (--ref-bitrate, bitrate.reference or bitrate.table)")
+    if args.hdr_factor is not None and not policy.scaled:
+        parser.error("bitrate.hdr_factor needs a scaled limit (--ref-bitrate, bitrate.reference or bitrate.table)")
 
     max_resolution = None
     if args.max_resolution:
@@ -503,7 +530,8 @@ class PlanEntry:
     width: int | None = None                    # display dimensions
     height: int | None = None
     fps: float | None = None
-    action: str = "skip"                        # "transcode" | "skip" | "low_saving" | "probe_failed"
+    hdr: str | None = None                      # e.g. "HLG + Dolby Vision"; None for SDR
+    action: str = "skip"                       # "transcode" | "skip" | "low_saving" | "probe_failed"
     output: Path | None = None
     limit: float | None = None                  # this file's bitrate limit (kbps)
     target_bitrate: float | None = None         # kbps passed to the encoder
@@ -549,6 +577,7 @@ def build_plan(
         streams = parse_streams(probe)
         w, h, fps = streams["width"], streams["height"], streams["fps"]
         entry.width, entry.height, entry.fps = w, h, fps
+        entry.hdr = streams["hdr"]
 
         # A resolution-scaled limit is meaningless without the dimensions.
         if policy.scaled and not (w and h):
@@ -563,7 +592,8 @@ def build_plan(
         # The limit follows the *output* resolution: a 4K file downscaled to
         # 1440p gets the 1440p budget.
         out_w, out_h = scale_to or (w, h)
-        limit = entry.limit = policy.limit_for(out_w * out_h if w and h else None, fps)
+        limit = entry.limit = policy.limit_for(out_w * out_h if w and h else None, fps,
+                                               hdr=entry.hdr is not None)
 
         over_bitrate = limit is not None and entry.bitrate > limit
         if not over_bitrate and scale_to is None:
@@ -633,6 +663,8 @@ def _describe(e: PlanEntry) -> str:
         parts.append(f"{e.width}x{e.height}")
     if e.fps:
         parts.append(f"{e.fps:.3g} fps")
+    if e.hdr:
+        parts.append(e.hdr)
     if e.size is not None:
         parts.append(fmt_size(e.size))
     if e.limit is not None:
@@ -659,6 +691,9 @@ def describe_policy(policy: BitratePolicy, sources: dict[str, str]) -> list[str]
     if policy.fps_ref:
         lines.append(f"  fps scaling    : (fps / {policy.fps_ref:g})^{policy.fps_exponent:g}"
                      f"{_tag(sources, 'fps_ref', 'fps_exponent')}")
+    if policy.hdr_factor != 1:
+        lines.append(f"  hdr factor     : x{policy.hdr_factor:g} for HDR sources"
+                     f"{_tag(sources, 'hdr_factor')}")
     lines.append(f"  max-bitrate    : {cap}")
     return lines
 
@@ -770,7 +805,7 @@ def print_dry_run(plan: list[PlanEntry], handbrake: str):
 
     for i, entry in enumerate(to_transcode, 1):
         cmd = build_handbrake_cmd(handbrake, entry.path, temp_path_for(entry.output),
-                                  entry.target_bitrate, entry.box)
+                                  entry.target_bitrate, entry.box, hdr=entry.hdr is not None)
         quoted = [_quote(arg) for arg in cmd]
         print(f"# [{i}/{len(to_transcode)}] {entry.path.name}  ({entry.bitrate:.0f} kbps)")
         if is_windows:
@@ -788,10 +823,13 @@ def build_handbrake_cmd(
     output_path: Path,
     target_bitrate: float,
     box: tuple[int, int] | None = None,
+    hdr: bool = False,
 ) -> list[str]:
     """
     HEVC via NVENC at target_bitrate kbps, audio copied. When box is given the
     video is scaled down to fit inside it (aspect ratio kept, never upscaled).
+    HDR sources are encoded as 10-bit Main10 with HDR dynamic metadata passed
+    through; HandBrake carries the source's color signaling over by default.
     All other stream properties (framerate, etc.) are passed through.
     """
     cmd = [
@@ -799,10 +837,15 @@ def build_handbrake_cmd(
         "--input",  str(input_path),
         "--output", str(output_path),
         # Video
-        "--encoder",        "nvenc_h265",
+        "--encoder",        "nvenc_h265_10bit" if hdr else "nvenc_h265",
         "--vb",             str(int(target_bitrate)),   # target bitrate (kbps)
         "--pfr",                                     # peak framerate: preserve source
     ]
+    if hdr:
+        cmd += [
+            "--encoder-profile",      "main10",
+            "--hdr-dynamic-metadata", "all",         # Dolby Vision / HDR10+ when supported
+        ]
     if box:
         cmd += [
             "--maxWidth",  str(box[0]),
@@ -888,7 +931,8 @@ def execute_plan(
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = temp_path_for(dst)
-        cmd = build_handbrake_cmd(handbrake, src, tmp, target, entry.box)
+        cmd = build_handbrake_cmd(handbrake, src, tmp, target, entry.box,
+                                  hdr=entry.hdr is not None)
 
         try:
             if tmp.exists():
@@ -999,7 +1043,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Stream HandBrakeCLI output directly to the terminal")
     # Profile-only settings (no CLI flag)
     parser.set_defaults(bitrate_exponent=None, bitrate_table=None,
-                        fps_ref=None, fps_exponent=None)
+                        fps_ref=None, fps_exponent=None, hdr_factor=None)
     return parser
 
 def main():
