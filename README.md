@@ -3,7 +3,7 @@
 A collection of Python scripts for organizing, compressing, and deduplicating media archives.
 
 - **`media_date_rename.py`** — Rename photos and videos to their capture date/time.
-- **`video_transcode.py`** — Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC).
+- **`video_transcode.py`** — Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC and/or Intel Quick Sync Video, in parallel).
 - **`find_duplicates.py`** — Detect duplicate images and videos using perceptual hashing and duration matching.
 
 ---
@@ -64,7 +64,7 @@ python media_date_rename.py ~/Pictures --recursive --postfix " - vacation" --yes
 
 ## video_transcode.py
 
-Transcodes videos to HEVC (H.265) using HandBrakeCLI with NVIDIA NVENC hardware encoding. Only files whose bitrate exceeds their bitrate limit and/or whose resolution exceeds `--max-resolution` are transcoded; others are skipped. The limit can be fixed (`--max-bitrate`) or scaled to each file's resolution (`--ref-bitrate`, or a table in a [profile](#profiles)), so 1080p and 1440p files in the same run each get an appropriate budget. Audio tracks are copied without re-encoding. The preview shows the estimated output size and saving for each file, and `--min-saving` can skip files that would not shrink enough.
+Transcodes videos to HEVC (H.265) using HandBrakeCLI with hardware encoding — NVIDIA NVENC, Intel Quick Sync Video (QSV), or both in parallel (see [Parallel encoding](#parallel-encoding)). Only files whose bitrate exceeds their bitrate limit and/or whose resolution exceeds `--max-resolution` are transcoded; others are skipped. The limit can be fixed (`--max-bitrate`) or scaled to each file's resolution (`--ref-bitrate`, or a table in a [profile](#profiles)), so 1080p and 1440p files in the same run each get an appropriate budget. Audio tracks are copied without re-encoding. The preview shows the estimated output size and saving for each file, and `--min-saving` can skip files that would not shrink enough.
 
 By default the originals are **replaced in place**, and each one is deleted only after its replacement has been verified — see [In-place replacement](#in-place-replacement-no---output-dir). Pass `--output-dir` to write elsewhere and leave the originals untouched.
 
@@ -72,7 +72,7 @@ By default the originals are **replaced in place**, and each one is deleted only
 
 - [HandBrake](https://handbrake.fr/) (provides `HandBrakeCLI`)
 - [FFmpeg](https://ffmpeg.org/) (provides `ffprobe`)
-- An NVIDIA GPU with NVENC support
+- At least one hardware HEVC encoder: an NVIDIA GPU with NVENC, and/or an Intel iGPU with Quick Sync Video (on a desktop with a discrete GPU, the iGPU usually has to be enabled in the BIOS, e.g. "iGPU Multi-Monitor", and its driver installed)
 
 Both `HandBrakeCLI` and `ffprobe` must be available in `PATH`, or their paths supplied via `--handbrake`. Profiles (`-p`) need Python 3.11+.
 
@@ -101,6 +101,7 @@ At least one of `--max-bitrate` / `--ref-bitrate` / `--max-resolution` is requir
 | `--dry-run`            | Preview and print the exact HandBrakeCLI commands without running them (never prompts) |
 | `--skip-errors`        | Continue past files that fail                              |
 | `--handbrake <path>`   | Path to HandBrakeCLI binary (default: auto-detect)         |
+| `--encoders <list>`    | Hardware encoders to use, comma-separated: `nvenc`, `qsv` (default: every one HandBrakeCLI reports as available) |
 | `--postfix <string>`   | Append a string to output filenames (default: empty)       |
 | `--show-log`           | Stream HandBrakeCLI output directly to the terminal        |
 
@@ -160,16 +161,29 @@ The exponent is below 1 because the bitrate needed for equal quality grows more 
 
 - The encoder targets `min(limit, source bitrate)`, so the bitrate is never raised above the source's. When a file is downscaled, the source bitrate is first scaled to the smaller frame along the same `pixels ^ exponent` curve.
 - With `--max-resolution` only (no bitrate limit), the target is that scaled source bitrate.
-- The preview estimates each output as `duration × (target video bitrate + audio bitrate)`. This is an approximation; NVENC often lands at or below the target. Audio streams reporting no bitrate are assumed to be 128 kbps.
+- The preview estimates each output as `duration × (target video bitrate + audio bitrate)`. This is an approximation; the hardware encoders often land at or below the target (QSV typically a few percent lower than NVENC). Audio streams reporting no bitrate are assumed to be 128 kbps.
 - `--min-saving <percent>` skips files whose estimated saving falls below the threshold; they are listed separately in the preview.
 
 ### HDR
 
-HDR sources (HLG or HDR10/PQ, detected from the stream's transfer characteristics) are encoded with `nvenc_h265_10bit` as 10-bit Main10, so the BT.2020 color and HLG/PQ transfer signaling carry over. SDR sources keep the 8-bit `nvenc_h265` encoder.
+HDR sources (HLG or HDR10/PQ, detected from the stream's transfer characteristics) are encoded with the 10-bit encoder (`nvenc_h265_10bit` / `qsv_h265_10bit`) as Main10, so the BT.2020 color and HLG/PQ transfer signaling carry over. SDR sources use the 8-bit `nvenc_h265` / `qsv_h265`.
 
-- HDR dynamic metadata is requested with `--hdr-dynamic-metadata all`, but as of HandBrake 1.11 the NVENC encoder drops Dolby Vision. iPhone Dolby Vision clips (profile 8.4) still play back as HLG HDR without it.
+- HDR dynamic metadata is requested with `--hdr-dynamic-metadata all`, but as of HandBrake 1.11 neither NVENC nor QSV keeps Dolby Vision. iPhone Dolby Vision clips (profile 8.4) still play back as HLG HDR without it.
 - The preview shows the HDR type next to each HDR file.
 - HDR needs more bitrate than SDR for the same quality. A profile can set `bitrate.hdr_factor` (e.g. `1.25`, the HDR/SDR ratio in YouTube's recommendations) to raise the limit for HDR files. It needs a scaled limit, and `bitrate.max` still caps the result.
+
+### Parallel encoding
+
+Each available encoder runs one HandBrakeCLI job at a time, and all of them pull from one shared queue. On a machine with both an NVIDIA GPU and an Intel iGPU, NVENC and QSV therefore work side by side; `--encoders nvenc` restricts the run to one.
+
+- The queue is ordered by estimated work (`duration × width × height × fps`), largest first, and the largest file goes to NVENC. Whichever encoder frees up takes the next file, so the run ends on small files instead of one encoder idling while the other finishes a long one.
+- At the same `--vb` target, QSV and NVENC output were within 0.6 VMAF points of each other in testing (well below a visible difference), and HDR files are handled the same way on both.
+- If a file fails without `--skip-errors`, no new jobs start; jobs already running finish normally, then the run aborts. Ctrl+C stops all running jobs and deletes their partial output.
+- `--show-log` streams one job's output, so it runs on the first encoder only.
+
+### Frame timing
+
+Frame timestamps are passed through unchanged (HandBrake `--vfr`), so variable-frame-rate phone footage keeps every frame and stays in sync with its audio. (HandBrake's `--pfr` caps the rate at its detected frame rate, which for phone VFR clips detected as e.g. 29.83 fps drops a frame every few seconds.)
 
 ### Profiles
 

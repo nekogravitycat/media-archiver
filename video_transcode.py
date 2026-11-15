@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-video_transcode.py -- Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC).
+video_transcode.py -- Transcode videos to HEVC using HandBrakeCLI (NVIDIA NVENC
+and/or Intel Quick Sync Video).
 
 Encodes files whose bitrate exceeds their bitrate limit and/or whose resolution
 exceeds --max-resolution. Other files are skipped. Audio tracks are copied
 without re-encoding.
+
+Every available hardware encoder runs one job at a time in parallel, pulling
+from a shared queue ordered largest job first, so the run ends on small files.
 
 The bitrate limit is either fixed (--max-bitrate) or scaled to each file's
 output resolution (--ref-bitrate, or a [bitrate.table] in a profile), so a
@@ -40,6 +44,8 @@ Options:
     --dry-run               Preview and print the exact HandBrakeCLI commands without running them
     --skip-errors           Continue past files that fail
     --handbrake <path>      Path to HandBrakeCLI binary (default: auto-detect)
+    --encoders <list>       Hardware encoders to use, comma-separated: nvenc, qsv
+                            (default: every one HandBrakeCLI reports as available)
 
 Examples:
     python video_transcode.py ~/Videos --max-bitrate 8000
@@ -56,8 +62,11 @@ import math
 import os
 import re
 import shutil
+import queue
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +94,13 @@ HDR_TRANSFERS = {"arib-std-b67": "HLG", "smpte2084": "HDR10"}
 DEFAULT_BITRATE_EXPONENT = 0.75
 DEFAULT_FPS_EXPONENT = 0.5
 
+# HandBrake HEVC encoders per hardware backend: (8-bit SDR, 10-bit HDR). Order
+# matters: the first available one gets the largest job.
+ENCODERS = {
+    "nvenc": ("nvenc_h265", "nvenc_h265_10bit"),
+    "qsv":   ("qsv_h265",   "qsv_h265_10bit"),
+}
+
 # Where a bare --profile name is looked up, in order.
 PROFILE_DIRS = [
     Path(__file__).resolve().parent / "profiles",
@@ -105,6 +121,37 @@ def find_tool(name: str, hint: str, override: str | None = None) -> str:
         print(f"        {hint}")
         sys.exit(1)
     return found
+
+def detect_encoders(handbrake: str) -> list[str]:
+    """Backends in ENCODERS whose SDR and HDR encoders HandBrakeCLI lists.
+    HandBrake only lists hardware encoders it could initialize on this machine."""
+    try:
+        result = subprocess.run([handbrake, "--help"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    text = result.stdout + result.stderr
+    return [name for name, pair in ENCODERS.items()
+            if all(re.search(rf"\b{enc}\b", text) for enc in pair)]
+
+def resolve_encoders(parser: argparse.ArgumentParser, requested: str | None,
+                     handbrake: str) -> list[str]:
+    """The --encoders list (or every available backend), in ENCODERS order."""
+    available = detect_encoders(handbrake)
+    if requested is None:
+        if not available:
+            parser.error("HandBrakeCLI reports no usable hardware HEVC encoder "
+                         f"({', '.join(ENCODERS)})")
+        return available
+    names = [n.strip().lower() for n in requested.split(",") if n.strip()]
+    unknown = [n for n in names if n not in ENCODERS]
+    if unknown or not names:
+        what = f"unknown encoder '{', '.join(unknown)}'" if unknown else "no encoder given"
+        parser.error(f"--encoders: {what} (choose from {', '.join(ENCODERS)})")
+    missing = [n for n in names if n not in available]
+    if missing:
+        parser.error(f"--encoders: {', '.join(missing)} not available in HandBrakeCLI "
+                     "(for qsv, the Intel iGPU must be enabled and its driver installed)")
+    return [n for n in ENCODERS if n in names]
 
 # -- Probing ------------------------------------------------------------------
 
@@ -610,7 +657,7 @@ def build_plan(
         entry.scale_to = scale_to
         entry.box = box if scale_to else None
 
-        # Estimate: duration x (video target + copied audio). NVENC ABR often
+        # Estimate: duration x (video target + copied audio). Hardware ABR often
         # lands at or below the target, so this is an upper-bound estimate.
         if entry.duration:
             entry.est_size = entry.duration * (entry.target_bitrate + streams["audio_kbps"]) * 1000 / 8
@@ -650,6 +697,18 @@ def resolve_conflict(target: Path, claimed: set[Path]) -> Path:
 def temp_path_for(dst: Path) -> Path:
     """In-progress path written by HandBrake, promoted to dst only after verification."""
     return dst.parent / (dst.stem + TEMP_SUFFIX)
+
+def encode_cost(e: PlanEntry) -> float:
+    """Relative encoding work: pixels decoded per second x seconds. 0 when unknown."""
+    if not (e.duration and e.width and e.height):
+        return 0.0
+    return e.duration * e.width * e.height * (e.fps or 30.0)
+
+def job_order(plan: list[PlanEntry]) -> list[PlanEntry]:
+    """Files to transcode, largest job first (ties keep the plan's path order).
+    With several encoders pulling from one queue this leaves only small jobs
+    for the end, so no encoder idles long while another finishes a big file."""
+    return sorted((e for e in plan if e.action == "transcode"), key=encode_cost, reverse=True)
 
 # -- Preview ------------------------------------------------------------------
 
@@ -697,7 +756,8 @@ def describe_policy(policy: BitratePolicy, sources: dict[str, str]) -> list[str]
     lines.append(f"  max-bitrate    : {cap}")
     return lines
 
-def print_preview(plan: list[PlanEntry], config: Config, output_dir: Path | None):
+def print_preview(plan: list[PlanEntry], config: Config, output_dir: Path | None,
+                  encoders: list[str]):
     sources = config.sources
     min_saving = config.min_saving
     transcode  = [e for e in plan if e.action == "transcode"]
@@ -722,6 +782,8 @@ def print_preview(plan: list[PlanEntry], config: Config, output_dir: Path | None
         print("  output-dir     : (none -- originals are replaced in place)")
     else:
         print(f"  output-dir     : {output_dir}")
+    print(f"  encoders       : {', '.join(encoders)}"
+          + ("  (in parallel, largest file first)" if len(encoders) > 1 else ""))
     print(f"  Total files    : {len(plan)}")
     print(f"{'─'*72}")
 
@@ -788,8 +850,8 @@ def _quote(arg: str) -> str:
         return f'"{arg}"'
     return arg
 
-def print_dry_run(plan: list[PlanEntry], handbrake: str):
-    to_transcode = [e for e in plan if e.action == "transcode"]
+def print_dry_run(plan: list[PlanEntry], handbrake: str, encoders: list[str]):
+    to_transcode = job_order(plan)
 
     if not to_transcode:
         print("No files need transcoding. Nothing to do.\n")
@@ -801,11 +863,16 @@ def print_dry_run(plan: list[PlanEntry], handbrake: str):
     print(f"\n{'─'*72}")
     print(f"  Dry run -- {len(to_transcode)} command(s) that would be executed ({shell_label}):")
     print(f"  Each writes to a {TEMP_SUFFIX} file, which is verified and then renamed.")
+    if len(encoders) > 1:
+        others = ", ".join(ENCODERS[n][0] for n in encoders[1:])
+        print(f"  Listed in run order. Commands show {ENCODERS[encoders[0]][0]}; a job picked up")
+        print(f"  by another encoder uses {others} (or its _10bit variant) instead.")
     print(f"{'─'*72}\n")
 
     for i, entry in enumerate(to_transcode, 1):
         cmd = build_handbrake_cmd(handbrake, entry.path, temp_path_for(entry.output),
-                                  entry.target_bitrate, entry.box, hdr=entry.hdr is not None)
+                                  entry.target_bitrate, entry.box, hdr=entry.hdr is not None,
+                                  encoder=encoders[0])
         quoted = [_quote(arg) for arg in cmd]
         print(f"# [{i}/{len(to_transcode)}] {entry.path.name}  ({entry.bitrate:.0f} kbps)")
         if is_windows:
@@ -824,27 +891,35 @@ def build_handbrake_cmd(
     target_bitrate: float,
     box: tuple[int, int] | None = None,
     hdr: bool = False,
+    encoder: str = "nvenc",
 ) -> list[str]:
     """
-    HEVC via NVENC at target_bitrate kbps, audio copied. When box is given the
-    video is scaled down to fit inside it (aspect ratio kept, never upscaled).
-    HDR sources are encoded as 10-bit Main10 with HDR dynamic metadata passed
-    through; HandBrake carries the source's color signaling over by default.
-    All other stream properties (framerate, etc.) are passed through.
+    HEVC via the given ENCODERS backend at target_bitrate kbps, audio copied.
+    When box is given the video is scaled down to fit inside it (aspect ratio
+    kept, never upscaled). HDR sources are encoded as 10-bit Main10; HandBrake
+    carries the source's color signaling over by default. Frame timestamps are
+    passed through unchanged.
     """
+    sdr_encoder, hdr_encoder = ENCODERS[encoder]
     cmd = [
         handbrake,
         "--input",  str(input_path),
         "--output", str(output_path),
         # Video
-        "--encoder",        "nvenc_h265_10bit" if hdr else "nvenc_h265",
+        "--encoder",        hdr_encoder if hdr else sdr_encoder,
         "--vb",             str(int(target_bitrate)),   # target bitrate (kbps)
-        "--pfr",                                     # peak framerate: preserve source
+        # Keep the source's frame timestamps. --pfr caps the rate at HandBrake's
+        # detected fps, which on phone VFR footage (detected e.g. 29.83) drops a
+        # frame every few seconds and stretches the timeline.
+        "--vfr",
     ]
     if hdr:
         cmd += [
             "--encoder-profile",      "main10",
-            "--hdr-dynamic-metadata", "all",         # Dolby Vision / HDR10+ when supported
+            # Requests HDR10+ / Dolby Vision passthrough, but as of HandBrake
+            # 1.11 neither NVENC nor QSV keeps Dolby Vision; the HLG/PQ base
+            # layer and its color signaling still carry over.
+            "--hdr-dynamic-metadata", "all",
         ]
     if box:
         cmd += [
@@ -902,112 +977,227 @@ def copy_timestamps(src: Path, dst: Path):
 class TranscodeError(Exception):
     """A file failed to transcode or verify; its original stays untouched."""
 
+class _Cancelled(Exception):
+    """The run was interrupted while this job was running."""
+
+@dataclass
+class JobResult:
+    entry: PlanEntry
+    encoder: str
+    status: str = "failed"          # "ok" | "kept" | "failed" | "cancelled"
+    message: str = ""
+    src_size: int = 0
+    new_size: int = 0
+    seconds: float = 0.0
+
+@dataclass
+class _RunState:
+    """Shared between the worker threads; `lock` guards procs and printing."""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    stop: threading.Event = field(default_factory=threading.Event)     # start no new jobs
+    cancel: threading.Event = field(default_factory=threading.Event)   # discard running jobs
+    procs: dict[str, subprocess.Popen] = field(default_factory=dict)  # encoder -> HandBrakeCLI
+
+def fmt_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+def transcode_one(entry: PlanEntry, encoder: str, handbrake: str, ffprobe: str,
+                  in_place: bool, show_log: bool, state: _RunState) -> JobResult:
+    """Encode one file to a temp file, verify it, then promote it. The original
+    is only removed after its replacement is in place."""
+    src, dst = entry.path, entry.output
+    result = JobResult(entry, encoder)
+    tmp = temp_path_for(dst)
+    cmd = build_handbrake_cmd(handbrake, src, tmp, entry.target_bitrate, entry.box,
+                              hdr=entry.hdr is not None, encoder=encoder)
+    start = time.monotonic()
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if tmp.exists():
+            tmp.unlink()  # leftover from an interrupted run
+
+        pipe = None if show_log else subprocess.PIPE
+        with state.lock:
+            if state.cancel.is_set():
+                raise _Cancelled
+            proc = subprocess.Popen(cmd, text=True, stdout=pipe, stderr=pipe,
+                                    encoding="utf-8", errors="replace")
+            state.procs[encoder] = proc
+        try:
+            _, stderr = proc.communicate()
+        finally:
+            with state.lock:
+                state.procs.pop(encoder, None)
+        if state.cancel.is_set():
+            raise _Cancelled
+
+        if proc.returncode != 0:
+            message = f"HandBrakeCLI exited with code {proc.returncode}"
+            if stderr:
+                message += "\n" + "\n".join(
+                    f"           {line}" for line in stderr.strip().splitlines()[-5:])
+            raise TranscodeError(message)
+
+        reason = verify_output(ffprobe, tmp, entry.duration)
+        if reason:
+            raise TranscodeError(f"Verification failed -- {reason}")
+
+        result.src_size = src.stat().st_size
+        result.new_size = tmp.stat().st_size
+
+        # Transcoding a file that is already efficiently encoded can inflate
+        # it; replacing the original in that case would make the archive worse.
+        if in_place and result.new_size >= result.src_size:
+            result.status = "kept"
+        else:
+            copy_timestamps(src, tmp)
+            # Promote first, then delete: if the rename fails the original is
+            # still there. When dst == src the rename replaces it atomically.
+            tmp.replace(dst)
+            if in_place and dst != src:
+                src.unlink()
+            result.status = "ok"
+    except _Cancelled:
+        result.status = "cancelled"
+    except Exception as e:
+        result.status, result.message = "failed", str(e)
+    finally:
+        result.seconds = time.monotonic() - start
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return result
+
+def _report(r: JobResult, label: str):
+    e, took = r.entry, f"({r.encoder}, {fmt_duration(r.seconds)})"
+    if r.status == "ok":
+        print(f"  {label} [OK] {e.path.name}: {fmt_size(r.src_size)} -> {fmt_size(r.new_size)} "
+              f"(saved {fmt_size(r.src_size - r.new_size)})  {took}")
+    elif r.status == "kept":
+        print(f"  {label} [KEPT] {e.path.name}: output is not smaller "
+              f"({fmt_size(r.src_size)} -> {fmt_size(r.new_size)}); original kept.  {took}")
+    elif r.status == "failed":
+        print(f"  {label} [ERROR] {e.path.name}: {r.message}  {took}")
+        print("         The original file was left untouched.")
+
 def execute_plan(
     plan: list[PlanEntry],
     handbrake: str,
     ffprobe: str,
     skip_errors: bool,
     in_place: bool,
+    encoders: list[str],
     show_log: bool = False,
 ):
-    to_transcode = [e for e in plan if e.action == "transcode"]
-
+    to_transcode = job_order(plan)
     if not to_transcode:
         print("Nothing to transcode.")
         return
+    if show_log and len(encoders) > 1:
+        print(f"[NOTE] --show-log runs one job at a time, on {encoders[0]} only.")
+        encoders = encoders[:1]
 
-    print(f"\nTranscoding {len(to_transcode)} file(s)...\n")
-    success, skipped, kept = 0, 0, 0
-    bytes_before, bytes_after = 0, 0   # totals over successfully transcoded files
+    total = len(to_transcode)
+    print(f"\nTranscoding {total} file(s) with {', '.join(encoders)}"
+          + (", largest first" if len(encoders) > 1 else "") + "...\n")
 
-    for i, entry in enumerate(to_transcode, 1):
-        src, dst, target = entry.path, entry.output, entry.target_bitrate
+    jobs: queue.Queue[PlanEntry] = queue.Queue()
+    for entry in to_transcode:
+        jobs.put(entry)
+    state = _RunState()
+    results: list[JobResult] = []
+    started = 0
 
-        line = f"  [{i}/{len(to_transcode)}] {src.name}  ({entry.bitrate:.0f} kbps -> {int(target)} kbps"
-        if entry.scale_to:
-            line += f", {entry.width}x{entry.height} -> {entry.scale_to[0]}x{entry.scale_to[1]}"
-        print(line + ")")
-        print(f"         -> {dst}" + ("  (in place)" if in_place else ""))
+    def worker(encoder: str):
+        nonlocal started
+        while not state.stop.is_set():
+            # Claim the job and its number together, so the largest job goes to
+            # the first encoder and numbers follow the start order.
+            with state.lock:
+                try:
+                    entry = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                started += 1
+                label = f"[{started}/{total}]"
+                line = (f"  {label} {encoder:<5} {entry.path.name}  "
+                        f"({entry.bitrate:.0f} kbps -> {int(entry.target_bitrate)} kbps")
+                if entry.scale_to:
+                    line += (f", {entry.width}x{entry.height} -> "
+                             f"{entry.scale_to[0]}x{entry.scale_to[1]}")
+                print(line + ")")
+                print(f"         -> {entry.output}" + ("  (in place)" if in_place else ""))
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = temp_path_for(dst)
-        cmd = build_handbrake_cmd(handbrake, src, tmp, target, entry.box,
-                                  hdr=entry.hdr is not None)
+            r = transcode_one(entry, encoder, handbrake, ffprobe, in_place, show_log, state)
+            with state.lock:
+                results.append(r)
+                _report(r, label)
+                if r.status == "failed" and not skip_errors and not state.stop.is_set():
+                    state.stop.set()
+                    if state.procs:
+                        print("         Stopping: no new jobs; waiting for running ones to finish.")
 
-        try:
-            if tmp.exists():
-                tmp.unlink()  # leftover from an interrupted run
+    threads = []
+    for encoder in encoders:
+        t = threading.Thread(target=worker, args=(encoder,), daemon=True)
+        t.start()
+        threads.append(t)
+        # Give each worker a moment to claim its first job so the first
+        # (fastest) encoder reliably takes the largest file.
+        time.sleep(0.05)
 
-            result = subprocess.run(cmd, text=True, capture_output=not show_log)
-            if result.returncode != 0:
-                message = f"HandBrakeCLI exited with code {result.returncode}"
-                if not show_log and result.stderr:
-                    message += "\n" + "\n".join(
-                        f"           {line}" for line in result.stderr.strip().splitlines()[-5:]
-                    )
-                raise TranscodeError(message)
+    try:
+        # join() with a timeout keeps the main thread responsive to Ctrl+C.
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(0.2)
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Stopping running jobs and cleaning up partial output...")
+        state.stop.set()
+        state.cancel.set()
+        with state.lock:
+            for proc in state.procs.values():
+                proc.terminate()
+        for t in threads:
+            t.join()
+        print("Originals of unfinished files were left untouched.")
+        sys.exit(130)
 
-            reason = verify_output(ffprobe, tmp, entry.duration)
-            if reason:
-                raise TranscodeError(f"Verification failed -- {reason}")
+    done = [r for r in results if r.status == "ok"]
+    kept = sum(r.status == "kept" for r in results)
+    failed = sum(r.status == "failed" for r in results)
+    not_started = total - len(results)
 
-            src_size = src.stat().st_size
-            new_size = tmp.stat().st_size
-
-            # Transcoding a file that is already efficiently encoded can inflate
-            # it; replacing the original in that case would make the archive worse.
-            if in_place and new_size >= src_size:
-                print(f"  [KEPT] Output is not smaller "
-                      f"({src_size / 1024 / 1024:.1f} MB -> {new_size / 1024 / 1024:.1f} MB); "
-                      f"original kept.")
-                tmp.unlink()
-                kept += 1
-            else:
-                copy_timestamps(src, tmp)
-                # Only now is the original expendable: the replacement is verified on disk.
-                if in_place:
-                    src.unlink()
-                tmp.replace(dst)
-
-                bytes_before += src_size
-                bytes_after  += new_size
-                print(f"  [OK] {fmt_size(src_size)} -> {fmt_size(new_size)} "
-                      f"(saved {fmt_size(src_size - new_size)})")
-                success += 1
-
-        except KeyboardInterrupt:
-            print("\n[INTERRUPTED] Cleaning up partial output...")
-            if tmp.exists():
-                tmp.unlink()
-            sys.exit(130)
-        except Exception as e:
-            # Report, discard the partial output, and honour --skip-errors.
-            print(f"  [ERROR] {e}")
-            if tmp.exists():
-                tmp.unlink()
-            if not skip_errors:
-                print("\nAborted. Use --skip-errors to continue past failures.")
-                print("The original file was left untouched.")
-                sys.exit(1)
-            skipped += 1
-
-        print()
-
-    summary = f"Done. Transcoded: {success}, skipped/failed: {skipped}"
+    print()
+    summary = f"Done. Transcoded: {len(done)}, skipped/failed: {failed}"
     if in_place:
         summary += f", kept (not smaller): {kept}"
+    if not_started:
+        summary += f", not started: {not_started}"
     print(summary)
-    if success and bytes_before > 0:
+    if len(encoders) > 1:
+        print("By encoder: " + ", ".join(
+            f"{enc} {sum(r.encoder == enc for r in results)}" for enc in encoders))
+    bytes_before = sum(r.src_size for r in done)
+    bytes_after = sum(r.new_size for r in done)
+    if bytes_before > 0:
         saved = bytes_before - bytes_after
         print(f"Total: {fmt_size(bytes_before)} -> {fmt_size(bytes_after)}  "
               f"(saved {fmt_size(saved)}, -{saved / bytes_before * 100:.0f}%)")
     print()
+    if failed and not skip_errors:
+        print("Aborted. Use --skip-errors to continue past failures.")
+        sys.exit(1)
 
 # -- Entry point --------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transcode videos to HEVC (NVENC) when bitrate or resolution exceeds a limit.",
+        description="Transcode videos to HEVC (NVENC / QSV) when bitrate or resolution exceeds a limit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1038,6 +1228,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Continue past files that fail")
     parser.add_argument("--handbrake",     metavar="PATH",
                         help="Path to HandBrakeCLI binary (default: auto-detect)")
+    parser.add_argument("--encoders",      metavar="LIST",
+                        help=f"Hardware encoders to run in parallel, comma-separated: "
+                             f"{', '.join(ENCODERS)} (default: every available one)")
     parser.add_argument("--postfix",       default="", metavar="STRING",
                         help="Postfix string appended to output filenames (default: empty)")
     parser.add_argument("--show-log",      action="store_true",
@@ -1056,6 +1249,7 @@ def main():
     handbrake = find_tool("HandBrakeCLI", "Install HandBrake and ensure HandBrakeCLI is accessible.",
                           args.handbrake)
     ffprobe   = find_tool("ffprobe", "Install ffmpeg (which includes ffprobe) to probe video bitrates.")
+    encoders  = resolve_encoders(parser, args.encoders, handbrake)
 
     # Resolve paths
     folder = Path(args.folder).expanduser().resolve()
@@ -1078,11 +1272,11 @@ def main():
     print(f"Probing {len(files)} file(s)...")
     plan = build_plan(files, ffprobe, config, output_dir, folder, args.recursive, args.postfix)
 
-    print_preview(plan, config, output_dir)
+    print_preview(plan, config, output_dir, encoders)
 
     # Dry run: print commands and exit
     if args.dry_run:
-        print_dry_run(plan, handbrake)
+        print_dry_run(plan, handbrake, encoders)
         return
 
     # Execute or prompt
@@ -1099,7 +1293,7 @@ def main():
         if input(prompt).strip().lower() != "y":
             print("Cancelled.\n")
             return
-    execute_plan(plan, handbrake, ffprobe, args.skip_errors, in_place, args.show_log)
+    execute_plan(plan, handbrake, ffprobe, args.skip_errors, in_place, encoders, args.show_log)
 
 
 if __name__ == "__main__":
